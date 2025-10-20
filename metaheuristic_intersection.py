@@ -21,8 +21,8 @@ class ProblemParameters:
 
     # Time discretization - EXTENDED to remove artificial time constraint
     dt: float = 0.5            # Time step (seconds) - [0.1-0.5 typical]
-    K: int = 100               # Number of time steps (INCREASED from 30)
-    T_max: float = 50.0        # Time horizon (seconds) (INCREASED from 15)
+    K: int = 200               # Maximum time steps (safety limit)
+    T_max: float = 100.0       # Maximum time horizon (seconds, safety limit)
 
     # NOTE: T_max is now an upper bound for simulation, not a hard constraint.
     # The objective function measures actual crossing time, which can be much less.
@@ -186,6 +186,41 @@ def simulate_vehicle_trajectory(u: np.ndarray, x0: float, v0: float,
     
     return x, v
 
+def simulate_until_completion(u_profile: np.ndarray,
+                              x0: float,
+                              v0: float,
+                              dt: float,
+                              L: float,
+                              K_max: int = 200) -> Tuple[np.ndarray, np.ndarray, int]:
+    """
+    Simulate vehicle trajectory until it exits control zone OR reaches K_max
+
+    Returns:
+        x: Position trajectory (variable length)
+        v: Velocity trajectory (variable length)
+        k_actual: Actual number of steps used
+    """
+    x = [x0]
+    v = [v0]
+
+    for k in range(K_max):
+        # Get acceleration for this step (or 0 if beyond u_profile length)
+        u_k = u_profile[k] if k < len(u_profile) else 0.0
+
+        # Update velocity and position
+        v_next = v[-1] + u_k * dt
+        x_next = x[-1] + v[-1] * dt + 0.5 * u_k * dt**2
+
+        v.append(v_next)
+        x.append(x_next)
+
+        # Check if vehicle exited control zone
+        if x_next >= L:
+            return np.array(x), np.array(v), k + 1
+
+    # Reached K_max without exiting
+    return np.array(x), np.array(v), K_max
+
 # ============================================================================
 # OBJECTIVE FUNCTION
 # ============================================================================
@@ -196,93 +231,77 @@ def objective_function(x_decision: np.ndarray,
                        t0: np.ndarray,
                        params: ProblemParameters) -> Tuple[float, float, float, Dict]:
     """
-    Compute objective function value
+    Compute objective function with ADAPTIVE time horizon
 
-    UPDATED: With extended time horizon (K=100, T_max=50s), vehicles have ample time.
-    The time minimization component naturally incentivizes rapid crossings.
-    We detect actual exit times and compute energy only up to exit (not full horizon).
-
-    Objective: minimize α·Σᵢ(tᵢ - tᵢ⁰) + (1-α)·Σᵢ Σₖ uᵢ²[k]·Δt
-
-    Decision variables:
-        x_decision = [u₁[0], u₁[1], ..., u₁[K-1],    # Vehicle 1 accelerations
-                      u₂[0], u₂[1], ..., u₂[K-1],    # Vehicle 2 accelerations
-                      ...
-                      uₙ[0], uₙ[1], ..., uₙ[K-1],    # Vehicle N accelerations
-                      Z₁₂, Z₁₃, ..., Zᵢⱼ]              # Binary priority variables
-
-    Args:
-        x_decision: Decision vector (N*K + n_conflicts,)
-        x0: Initial positions (N,)
-        v0: Initial velocities (N,)
-        t0: Initial times (N,)
-        params: Problem parameters
-
-    Returns:
-        f_total: Total objective value
-        f_time: Time component
-        f_energy: Energy component
-        info: Dictionary with detailed information
+    Each vehicle simulates until it exits (x >= L), not fixed K steps.
     """
     N = params.N
-    K = params.K
     dt = params.dt
+    alpha = params.alpha
+    L = params.L
 
-    # Extract acceleration profiles from decision vector
-    u_profiles = x_decision[:N*K].reshape(N, K)
+    # Extract acceleration profiles (use first K values, will be adaptively truncated)
+    K_nominal = params.K
+    u_profiles = x_decision[:N * K_nominal].reshape(N, K_nominal)
 
-    # Initialize metrics
-    travel_times = np.zeros(N)
-    energies = np.zeros(N)
+    # Simulate each vehicle until completion
     trajectories = []
-    actual_K_needed = 0  # Track maximum steps actually needed
+    completion_times = []
 
-    # Simulate each vehicle and compute metrics
     for i in range(N):
-        u_i = u_profiles[i, :]
-        x_traj, v_traj = simulate_vehicle_trajectory(u_i, x0[i], v0[i], dt, K)
+        x_traj, v_traj, k_actual = simulate_until_completion(
+            u_profiles[i], x0[i], v0[i], dt, L, K_max=params.K
+        )
+
         trajectories.append((x_traj, v_traj))
 
-        # Find time when vehicle exits control zone (x >= L)
-        exit_indices = np.where(x_traj >= params.L)[0]
-        if len(exit_indices) > 0:
-            k_exit = exit_indices[0]
-            t_exit = t0[i] + k_exit * dt
-            actual_K_needed = max(actual_K_needed, k_exit)
-        else:
-            # Vehicle doesn't reach exit - this will be caught by constraint checker
-            # Use full time horizon as penalty
-            k_exit = K - 1
-            t_exit = t0[i] + K * dt
-            actual_K_needed = K
+        # Calculate completion time for this vehicle
+        t_completion = t0[i] + k_actual * dt
+        completion_times.append(t_completion)
 
-        # Travel time: time to exit - initial time
-        travel_times[i] = t_exit - t0[i]
+    # Check if all vehicles completed
+    all_completed = all(traj[0][-1] >= L for traj in trajectories)
 
-        # Energy: integral of acceleration squared
-        # Only count energy up to exit time (not full K)
-        # This prevents penalizing unused time steps
-        energies[i] = np.sum(u_i[:k_exit+1]**2) * dt
+    if not all_completed:
+        # Penalize incomplete trajectories heavily
+        return 1e6, 1e6, 0.0, {
+            'all_completed': False,
+            'trajectories': trajectories,
+            'completion_times': completion_times
+        }
 
-    # Compute objective components
-    f_time = np.sum(travel_times)
-    f_energy = np.sum(energies)
+    # Calculate time cost (sum of actual completion times)
+    f_time = sum(completion_times)
 
-    # Total objective (weighted sum)
-    f_total = params.alpha * f_time + (1 - params.alpha) * f_energy
+    # Calculate energy cost (sum of squared accelerations up to actual completion)
+    f_energy = 0.0
+    for i in range(N):
+        x_traj, v_traj = trajectories[i]
+        k_actual = len(x_traj) - 1  # Actual steps used
 
-    # Additional information for analysis
+        # Only sum energy for steps actually used
+        u_actual = u_profiles[i, :k_actual]
+        f_energy += np.sum(u_actual ** 2) * dt
+
+    # Combined objective
+    f_total = alpha * f_time + (1 - alpha) * f_energy
+
     info = {
-        'travel_times': travel_times,
-        'energies': energies,
+        'all_completed': True,
         'trajectories': trajectories,
+        'completion_times': completion_times,
+        'f_time': f_time,
+        'f_energy': f_energy,
+        'f_total': f_total,
+        'travel_times': np.array(completion_times) - t0,  # For compatibility
+        'energies': np.array([np.sum(u_profiles[i, :len(trajectories[i][0])-1]**2)*dt for i in range(N)]),
+        'actual_K_needed': max(len(traj[0])-1 for traj in trajectories),
+        'time_efficiency': max(len(traj[0])-1 for traj in trajectories) / K_nominal,
+        'avg_crossing_time': f_time / N,
         'total_time': f_time,
-        'total_energy': f_energy,
-        'actual_K_needed': actual_K_needed,  # How many steps actually used
-        'time_efficiency': actual_K_needed / K,  # e.g., 0.3 means only used 30%
-        'avg_crossing_time': f_time / N  # Average time per vehicle
+        'total_energy': f_energy
     }
-    
+
     return f_total, f_time, f_energy, info
 
 # ============================================================================
@@ -812,31 +831,23 @@ def feasibility_check(x_decision: np.ndarray,
                       t0: np.ndarray,
                       params: ProblemParameters) -> Tuple[bool, Dict]:
     """
-    Master feasibility checker - evaluates all 7 constraints
-    
-    Args:
-        x_decision: Decision vector [u_profiles, Z_binary]
-        x0: Initial positions (N,)
-        v0: Initial velocities (N,)
-        t0: Initial times (N,)
-        params: Problem parameters
-        
-    Returns:
-        is_feasible: Boolean indicating if solution is feasible
-        all_violations: Dictionary containing results from all constraint checks
+    Master feasibility checker - evaluates all 7 constraints - now handles VARIABLE length trajectories
     """
+    # Simulate trajectories (adaptive horizon)
     N = params.N
-    K = params.K
+    K_nominal = params.K
     dt = params.dt
-    
-    # Extract decision variables
-    u_profiles = x_decision[:N*K].reshape(N, K)
-    Z_binary = x_decision[N*K:]  # Binary variables
-    
-    # Simulate all vehicles
+    L = params.L
+
+    u_profiles = x_decision[:N * K_nominal].reshape(N, K_nominal)
+    Z_binary = x_decision[N*K_nominal:]  # Binary variables
+
+    # Simulate each vehicle until completion
     trajectories = []
     for i in range(N):
-        x_traj, v_traj = simulate_vehicle_trajectory(u_profiles[i], x0[i], v0[i], dt, K)
+        x_traj, v_traj, k_actual = simulate_until_completion(
+            u_profiles[i], x0[i], v0[i], dt, L, K_max=params.K
+        )
         trajectories.append((x_traj, v_traj))
     
     # Check all constraints

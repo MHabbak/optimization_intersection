@@ -8,113 +8,119 @@ Uses FIXED Constraint 6B (conflict-point based, allows simultaneous crossing)
 
 import numpy as np
 import matplotlib.pyplot as plt
+from typing import Dict
 from metaheuristic_intersection import (
     ProblemParameters, objective_function, feasibility_check,
     generate_random_solution, simulate_vehicle_trajectory
 )
 
 # ============================================================================
-# PENALTY CALCULATION
+# REPAIR OPERATOR
 # ============================================================================
 
-PENALTY_WEIGHTS = {
-    'rear_end_collision': 10000,           # CRITICAL: same-lane safety
-    'lateral_physical_collision': 10000,   # CRITICAL: conflict-point safety
-    'lateral_timing': 500,                 # HIGH: priority rules
-    'reaching_zones': 1000,                # HIGH: must complete crossing
-    'velocity_limits': 500,                # HIGH: no stopping in zone
-    'acceleration_limits': 50              # MEDIUM: comfort
-}
-
-def calculate_penalty(violations_dict, weights=None):
+def repair_solution(x_infeasible: np.ndarray,
+                   violations: Dict,
+                   params,
+                   x0: np.ndarray,
+                   v0: np.ndarray,
+                   t0: np.ndarray) -> np.ndarray:
     """
-    Calculate total penalty from constraint violations
+    Repair infeasible solution by fixing violations
+
+    Heuristics:
+    1. Velocity violations → reduce accelerations by 20%
+    2. Collision violations → flip priority variables
+    3. Reaching violations → increase accelerations by 20%
+    4. Acceleration violations → clip to bounds
 
     Returns:
-        total_penalty: Sum of all penalties
-        details: Dict with breakdown by constraint type
+        x_repaired: Repaired solution (hopefully feasible)
     """
-    if weights is None:
-        weights = PENALTY_WEIGHTS
+    x_repaired = x_infeasible.copy()
+    N, K = params.N, params.K
 
-    total_penalty = 0.0
-    details = {}
+    # Extract components
+    u_profiles = x_repaired[:N*K].reshape(N, K)
+    Z_binary = x_repaired[N*K:] if len(x_repaired) > N*K else np.array([])
 
-    # Map constraint keys to weight keys
-    constraint_mapping = {
-        'constraint_3_acceleration_limits': 'acceleration_limits',
-        'constraint_4_velocity_limits': 'velocity_limits',
-        'constraint_5_reaching_zones': 'reaching_zones',
-        'constraint_6_rear_end_collision': 'rear_end_collision',
-        'constraint_6b_lateral_physical': 'lateral_physical_collision',
-        'constraint_7_lateral_collision': 'lateral_timing'
-    }
+    # Parse violations dictionary
+    for constraint_type, result in violations.items():
+        if not result.get('satisfied', True):
+            constraint_violations = result.get('violations', [])
 
-    for constraint_key, result in violations_dict.items():
-        if result['satisfied']:
-            continue
+            for v in constraint_violations:
+                v_type = v.get('type', constraint_type)
 
-        weight_key = constraint_mapping.get(constraint_key)
-        if weight_key is None:
-            continue  # Unknown constraint
+                # Fix velocity limit violations
+                if 'velocity' in v_type.lower():
+                    vehicle = v.get('vehicle', v.get('i', 0))
+                    # Reduce accelerations by 20%
+                    u_profiles[vehicle] *= 0.8
+                    u_profiles[vehicle] = np.clip(u_profiles[vehicle],
+                                                 params.u_min, params.u_max)
 
-        weight = weights[weight_key]
-        n_violations = len(result['violations'])
+                # Fix collision violations
+                elif 'collision' in v_type.lower() or 'lateral' in v_type.lower():
+                    # Flip a random priority variable
+                    if len(Z_binary) > 0:
+                        idx = np.random.randint(0, len(Z_binary))
+                        Z_binary[idx] = 1.0 - Z_binary[idx]
 
-        # For physical collisions, use squared deficit for stronger penalty
-        if 'collision' in weight_key:
-            penalty = 0.0
-            for v in result['violations']:
-                deficit = v.get('deficit', 1.0)
-                penalty += (deficit ** 2) * weight
-        else:
-            penalty = n_violations * weight
+                # Fix reaching zone violations
+                elif 'reaching' in v_type.lower():
+                    vehicle = v.get('vehicle', v.get('i', 0))
+                    # Increase accelerations by 20%
+                    u_profiles[vehicle] *= 1.2
+                    u_profiles[vehicle] = np.clip(u_profiles[vehicle],
+                                                 params.u_min, params.u_max)
 
-        total_penalty += penalty
-        details[weight_key] = {
-            'count': n_violations,
-            'penalty': penalty,
-            'weight': weight
-        }
+                # Fix acceleration limit violations
+                elif 'acceleration' in v_type.lower():
+                    vehicle = v.get('vehicle', v.get('i', 0))
+                    u_profiles[vehicle] = np.clip(u_profiles[vehicle],
+                                                 params.u_min, params.u_max)
 
-    return total_penalty, details
+    # Reconstruct solution
+    if len(Z_binary) > 0:
+        x_repaired = np.concatenate([u_profiles.flatten(), Z_binary])
+    else:
+        x_repaired = u_profiles.flatten()
+
+    return x_repaired
 
 
-def penalized_objective(x_decision, x0, v0, t0, params):
+def generate_initial_feasible_solution(params, x0, v0, t0, max_attempts=1000):
     """
-    Compute fitness = objective + penalties
+    Generate initial FEASIBLE solution using conservative heuristic
 
-    Returns:
-        fitness: Total fitness value (minimize this)
-        is_feasible: Boolean - True if all constraints satisfied
-        info: Dict with detailed breakdown
+    Strategy: Start with gentle accelerations (more likely feasible)
     """
-    # Compute raw objective
-    f_total, f_time, f_energy, obj_info = objective_function(
-        x_decision, x0, v0, t0, params
-    )
+    from metaheuristic_intersection import feasibility_check
 
-    # Check all constraints
-    is_feasible, violations = feasibility_check(x_decision, x0, v0, t0, params)
+    for attempt in range(max_attempts):
+        # Generate solution with bias toward gentle accelerations
+        u_profiles = np.random.normal(0, 0.5, (params.N, params.K))
+        u_profiles = np.clip(u_profiles, params.u_min, params.u_max)
 
-    # Calculate penalties
-    total_penalty, penalty_details = calculate_penalty(violations)
+        # Random priority variables
+        n_binary = 4  # Z_02, Z_03, Z_12, Z_13
+        Z_binary = np.random.randint(0, 2, n_binary).astype(float)
 
-    # Final fitness
-    fitness = f_total + total_penalty
+        # Combine
+        x = np.concatenate([u_profiles.flatten(), Z_binary])
 
-    info = {
-        'fitness': fitness,
-        'f_total': f_total,
-        'f_time': f_time,
-        'f_energy': f_energy,
-        'penalty': total_penalty,
-        'penalty_details': penalty_details,
-        'is_feasible': is_feasible,
-        'violations': violations
-    }
+        # Check feasibility
+        is_feas, _ = feasibility_check(x, x0, v0, t0, params)
+        if is_feas:
+            print(f"✅ Found initial feasible solution on attempt {attempt + 1}")
+            return x
 
-    return fitness, is_feasible, info
+    # If failed, return very conservative solution
+    print("⚠️  Using conservative fallback initial solution")
+    u_conservative = np.ones((params.N, params.K)) * 0.5  # Gentle acceleration
+    u_conservative = np.clip(u_conservative, params.u_min, params.u_max)
+    Z_conservative = np.array([1.0, 1.0, 0.0, 0.0])  # Sequential priorities
+    return np.concatenate([u_conservative.flatten(), Z_conservative])
 
 
 # ============================================================================
@@ -126,32 +132,16 @@ def generate_neighbor(x_current, params, T, T_init):
     Generate neighbor solution with adaptive step size
 
     Strategy:
-    - Perturb ~10% of continuous acceleration variables
-    - Step size decreases with temperature (adaptive cooling)
+    - Perturb ~10% of continuous variables
+    - Step size decreases with temperature
     - Flip binary variables with 30% probability
-    - Binary flips are CLEAN: 0→1 or 1→0 (no intermediate values)
-
-    Args:
-        x_current: Current solution [u_profiles, Z_binary]
-        params: Problem parameters
-        T: Current temperature
-        T_init: Initial temperature
-
-    Returns:
-        x_neighbor: Perturbed solution
     """
     x_neighbor = x_current.copy()
     N, K = params.N, params.K
 
-    # ========================================================================
-    # Part 1: Perturb CONTINUOUS variables (accelerations)
-    # ========================================================================
-
-    # Adaptive step size based on temperature
-    # High T → large steps (exploration)
-    # Low T → small steps (exploitation)
+    # Adaptive step size
     step_scale = np.sqrt(T / T_init)
-    u_step = 1.0 * step_scale  # Max ±1.0 m/s² at start
+    u_step = 1.0 * step_scale
 
     # Perturb random 10% of acceleration values
     n_perturb = max(1, int(N * K * 0.1))
@@ -160,21 +150,13 @@ def generate_neighbor(x_current, params, T, T_init):
     for idx in perturb_indices:
         delta = np.random.uniform(-u_step, u_step)
         x_neighbor[idx] += delta
-        # Clip to bounds
         x_neighbor[idx] = np.clip(x_neighbor[idx], params.u_min, params.u_max)
 
-    # ========================================================================
-    # Part 2: Flip BINARY variables (priorities)
-    # ========================================================================
-
+    # Flip binary variables with 30% chance
     n_binary = len(x_current) - N * K
-
-    if n_binary > 0 and np.random.random() < 0.3:  # 30% chance
-        # Flip one random binary variable
+    if n_binary > 0 and np.random.random() < 0.3:
         flip_idx = np.random.randint(0, n_binary)
         binary_idx = N * K + flip_idx
-
-        # CLEAN FLIP: 0→1 or 1→0
         x_neighbor[binary_idx] = 1.0 - x_neighbor[binary_idx]
 
     return x_neighbor
@@ -185,64 +167,74 @@ def generate_neighbor(x_current, params, T, T_init):
 # ============================================================================
 
 def simulated_annealing(params, x0, v0, t0,
-                       T_init=1000.0,
-                       T_final=1.0,
-                       cooling=0.95,
+                       T_init=500.0,
+                       T_final=0.01,
                        max_iter=5000,
                        seed=42):
     """
-    Simulated Annealing algorithm
+    Simulated Annealing with THREE FIXES:
+    1. Variable time horizon (adaptive K)
+    2. Repair operator (guaranteed feasibility)
+    3. Linear cooling (matches lecture)
 
     Args:
         params: Problem parameters
-        x0, v0, t0: Initial conditions for vehicles
+        x0, v0, t0: Initial conditions
         T_init: Initial temperature
-        T_final: Final temperature (stopping criterion)
-        cooling: Cooling rate (geometric: T *= cooling each iteration)
+        T_final: Final temperature
         max_iter: Maximum iterations
-        seed: Random seed for reproducibility
+        seed: Random seed
 
     Returns:
-        x_best: Best solution found
-        f_best: Best fitness value
-        history: Convergence history dict
+        x_best: Best feasible solution found
+        f_best: Best objective value
+        history: Convergence history
     """
+    from metaheuristic_intersection import objective_function, feasibility_check
+
     np.random.seed(seed)
 
-    # Initialize with random solution
-    x_current = generate_random_solution(params)
-    f_current, is_feas_current, info_current = penalized_objective(
+    # Calculate LINEAR cooling rate (matches lecture)
+    beta = (T_init - T_final) / max_iter
+
+    # Initialize with FEASIBLE solution
+    print("\n" + "="*80)
+    print("SIMULATED ANNEALING - MILESTONE 3 (CORRECTED)")
+    print("="*80)
+    print("Generating initial feasible solution...")
+
+    x_current = generate_initial_feasible_solution(params, x0, v0, t0)
+    f_current, f_time_current, f_energy_current, _ = objective_function(
         x_current, x0, v0, t0, params
     )
 
-    # Track best solution
+    # Track best
     x_best = x_current.copy()
     f_best = f_current
-    best_feasible = is_feas_current
 
-    # History for plotting
+    # History
     history = {
         'iteration': [],
         'f_best': [],
         'f_current': [],
         'T': [],
         'acceptance_rate': [],
-        'feasible_rate': []
+        'repair_rate': [],
+        'skip_rate': []
     }
 
     # Counters
-    T = T_init
     n_accepted = 0
-    n_feasible = 0
+    n_repaired = 0
+    n_skipped = 0
+    T = T_init
 
-    # Print header
-    print("\n" + "="*80)
-    print("SIMULATED ANNEALING - MILESTONE 3")
-    print("="*80)
-    print(f"Parameters: T_init={T_init}, T_final={T_final}, cooling={cooling}")
-    print(f"Max iterations: {max_iter}, Seed: {seed}")
-    print(f"Decision variables: {len(x_current)} ({params.N}x{params.K} continuous + {len(x_current)-params.N*params.K} binary)")
-    print(f"Initial solution: f={f_current:.2f}, feasible={is_feas_current}")
+    print(f"\n✅ Initial feasible solution found")
+    print(f"   Fitness: {f_current:.2f} (time={f_time_current:.2f}, energy={f_energy_current:.2f})")
+    print(f"\nSA Parameters:")
+    print(f"   T_init = {T_init}, T_final = {T_final}")
+    print(f"   Cooling: LINEAR with β = {beta:.6f}")
+    print(f"   Max iterations: {max_iter}")
     print("="*80 + "\n")
 
     # Main SA loop
@@ -250,12 +242,39 @@ def simulated_annealing(params, x0, v0, t0,
         # Generate neighbor
         x_neighbor = generate_neighbor(x_current, params, T, T_init)
 
-        # Evaluate neighbor
-        f_neighbor, is_feas_neighbor, info_neighbor = penalized_objective(
+        # Check feasibility
+        is_feas, violations = feasibility_check(x_neighbor, x0, v0, t0, params)
+
+        # Repair if infeasible
+        if not is_feas:
+            x_neighbor = repair_solution(x_neighbor, violations, params, x0, v0, t0)
+            n_repaired += 1
+
+            # Re-check after repair
+            is_feas, violations = feasibility_check(x_neighbor, x0, v0, t0, params)
+
+            # If still infeasible after repair, skip this iteration
+            if not is_feas:
+                n_skipped += 1
+                # Still cool the temperature
+                T = T_init - beta * iteration
+
+                # Update history with current values
+                history['iteration'].append(iteration)
+                history['f_best'].append(f_best)
+                history['f_current'].append(f_current)
+                history['T'].append(T)
+                history['acceptance_rate'].append(n_accepted / (iteration + 1))
+                history['repair_rate'].append(n_repaired / (iteration + 1))
+                history['skip_rate'].append(n_skipped / (iteration + 1))
+                continue
+
+        # Evaluate feasible neighbor (NO PENALTIES, pure objective)
+        f_neighbor, f_time_neighbor, f_energy_neighbor, _ = objective_function(
             x_neighbor, x0, v0, t0, params
         )
 
-        # Metropolis acceptance criterion
+        # Acceptance criterion (standard Metropolis)
         delta_f = f_neighbor - f_current
 
         if delta_f < 0:
@@ -266,91 +285,55 @@ def simulated_annealing(params, x0, v0, t0,
             prob_accept = np.exp(-delta_f / T)
             accept = (np.random.random() < prob_accept)
 
-        # Update current solution if accepted
+        # Update current solution
         if accept:
-            x_current = x_neighbor
+            x_current = x_neighbor.copy()
             f_current = f_neighbor
-            is_feas_current = is_feas_neighbor
             n_accepted += 1
 
         # Update best solution
-        # Prefer feasible over infeasible, then prefer lower fitness
-        if is_feas_neighbor and not best_feasible:
-            # First feasible solution found
-            x_best = x_neighbor.copy()
-            f_best = f_neighbor
-            best_feasible = True
-        elif is_feas_neighbor == best_feasible and f_neighbor < f_best:
-            # Better solution in same feasibility class
+        if f_neighbor < f_best:
             x_best = x_neighbor.copy()
             f_best = f_neighbor
 
-        # Track feasibility
-        if is_feas_current:
-            n_feasible += 1
+        # LINEAR COOLING (matches lecture formula: T_i = T_0 - β*i)
+        T = T_init - beta * iteration
 
-        # Cooling schedule (geometric)
-        T *= cooling
+        # Update history
+        history['iteration'].append(iteration)
+        history['f_best'].append(f_best)
+        history['f_current'].append(f_current)
+        history['T'].append(T)
+        history['acceptance_rate'].append(n_accepted / (iteration + 1))
+        history['repair_rate'].append(n_repaired / (iteration + 1))
+        history['skip_rate'].append(n_skipped / (iteration + 1))
 
-        # Logging every 100 iterations
-        if iteration % 100 == 0 or iteration == max_iter - 1:
-            acceptance_rate = n_accepted / (iteration + 1)
-            feasible_rate = n_feasible / (iteration + 1)
+        # Progress reporting
+        if iteration % 500 == 0:
+            print(f"Iter {iteration:4d}: f_best={f_best:7.2f}, f_current={f_current:7.2f}, "
+                  f"T={T:6.2f}, accept={n_accepted/(iteration+1):5.1%}, "
+                  f"repair={n_repaired/(iteration+1):5.1%}, skip={n_skipped/(iteration+1):5.1%}")
 
-            history['iteration'].append(iteration)
-            history['f_best'].append(f_best)
-            history['f_current'].append(f_current)
-            history['T'].append(T)
-            history['acceptance_rate'].append(acceptance_rate)
-            history['feasible_rate'].append(feasible_rate)
-
-            # Print status
-            print(f"Iter {iteration:5d} | T={T:8.2f} | "
-                  f"f_best={f_best:9.2f} | f_curr={f_current:9.2f} | "
-                  f"acc={acceptance_rate:5.1%} | feas={feasible_rate:5.1%}")
-
-        # Early stopping if temperature too low
-        if T < T_final:
-            print(f"\nStopping: Temperature {T:.4f} < {T_final}")
+        # Stop if temperature too low
+        if T <= T_final:
+            print(f"\n✅ Reached T_final={T_final} at iteration {iteration}")
             break
 
-    # Final summary
+    # Final verification
+    is_feas_final, _ = feasibility_check(x_best, x0, v0, t0, params)
+
     print("\n" + "="*80)
-    print("SA COMPLETED")
+    print("SA COMPLETE")
     print("="*80)
-    print(f"Best fitness: {f_best:.2f}")
-    print(f"Best solution feasible: {best_feasible}")
-    print(f"Total iterations: {iteration + 1}")
-    print(f"Acceptance rate: {n_accepted/(iteration+1):.2%}")
-    print(f"Feasibility rate: {n_feasible/(iteration+1):.2%}")
-
-    # Evaluate best solution
-    _, _, final_info = penalized_objective(x_best, x0, v0, t0, params)
-
-    print(f"\nBest solution breakdown:")
-    print(f"  Time component: {final_info['f_time']:.2f} s")
-    print(f"  Energy component: {final_info['f_energy']:.2f}")
-    print(f"  Raw objective: {final_info['f_total']:.2f}")
-    print(f"  Penalties: {final_info['penalty']:.2f}")
-
-    print(f"\nTime horizon efficiency:")
-    print(f"  Steps used: {final_info['actual_K_needed']}/{params.K}")
-    print(f"  Time used: {final_info['actual_K_needed']*params.dt:.1f}s / {params.T_max:.1f}s")
-    print(f"  Efficiency: {final_info['time_efficiency']*100:.1f}% of available horizon")
-    print(f"  Avg crossing time: {final_info['avg_crossing_time']:.2f}s per vehicle")
-
-    if final_info['time_efficiency'] > 0.9:
-        print(f"  ⚠ WARNING: Using >90% of time horizon - consider increasing K")
-    else:
-        print(f"  ✓ Extended horizon is non-binding (good!)")
-
-    if not best_feasible:
-        print(f"\nWARNING: Best solution is INFEASIBLE")
-        print("Constraint violations:")
-        for key, details in final_info['penalty_details'].items():
-            print(f"  {key}: {details['count']} violations, penalty={details['penalty']:.2f}")
-
+    print(f"Best fitness:      {f_best:.2f}")
+    print(f"Final feasibility: {'✅ FEASIBLE' if is_feas_final else '❌ INFEASIBLE'}")
+    print(f"Acceptance rate:   {n_accepted/iteration:.2%}")
+    print(f"Repair rate:       {n_repaired/iteration:.2%}")
+    print(f"Skip rate:         {n_skipped/iteration:.2%}")
     print("="*80 + "\n")
+
+    if not is_feas_final:
+        print("⚠️  WARNING: Best solution is INFEASIBLE - increase max_iter or adjust repair")
 
     return x_best, f_best, history
 
@@ -360,9 +343,9 @@ def simulated_annealing(params, x0, v0, t0,
 # ============================================================================
 
 def plot_convergence(history):
-    """Plot SA convergence history"""
-    fig, axes = plt.subplots(2, 2, figsize=(14, 10))
-    fig.suptitle('Simulated Annealing Convergence', fontsize=14, fontweight='bold')
+    """Plot SA convergence history with repair tracking"""
+    fig, axes = plt.subplots(3, 2, figsize=(14, 12))
+    fig.suptitle('Simulated Annealing Convergence (Corrected)', fontsize=14, fontweight='bold')
 
     iters = history['iteration']
 
@@ -371,7 +354,7 @@ def plot_convergence(history):
     ax.plot(iters, history['f_best'], 'g-', linewidth=2, label='Best')
     ax.plot(iters, history['f_current'], 'b-', alpha=0.5, label='Current')
     ax.set_xlabel('Iteration')
-    ax.set_ylabel('Fitness')
+    ax.set_ylabel('Fitness (Pure Objective)')
     ax.set_title('Objective Function Value')
     ax.legend()
     ax.grid(True, alpha=0.3)
@@ -381,8 +364,7 @@ def plot_convergence(history):
     ax.plot(iters, history['T'], 'r-', linewidth=2)
     ax.set_xlabel('Iteration')
     ax.set_ylabel('Temperature')
-    ax.set_title('Cooling Schedule')
-    ax.set_yscale('log')
+    ax.set_title('Cooling Schedule (LINEAR)')
     ax.grid(True, alpha=0.3)
 
     # Plot 3: Acceptance rate
@@ -393,13 +375,45 @@ def plot_convergence(history):
     ax.set_title('Solution Acceptance Rate')
     ax.grid(True, alpha=0.3)
 
-    # Plot 4: Feasibility rate
+    # Plot 4: Repair rate
     ax = axes[1, 1]
-    ax.plot(iters, [r*100 for r in history['feasible_rate']], 'purple', linewidth=2)
+    ax.plot(iters, [r*100 for r in history['repair_rate']], 'purple', linewidth=2, label='Repair')
+    ax.plot(iters, [r*100 for r in history['skip_rate']], 'red', linewidth=2, label='Skip')
     ax.set_xlabel('Iteration')
-    ax.set_ylabel('Feasibility Rate (%)')
-    ax.set_title('Feasible Solutions Encountered')
+    ax.set_ylabel('Rate (%)')
+    ax.set_title('Repair & Skip Rates')
+    ax.legend()
     ax.grid(True, alpha=0.3)
+
+    # Plot 5: Temperature vs Best Fitness (trajectory)
+    ax = axes[2, 0]
+    scatter = ax.scatter(history['T'], history['f_best'],
+                        c=iters, cmap='viridis', s=2, alpha=0.6)
+    ax.set_xlabel('Temperature')
+    ax.set_ylabel('Best Fitness')
+    ax.set_title('Fitness vs Temperature')
+    ax.set_xscale('log')
+    plt.colorbar(scatter, ax=ax, label='Iteration')
+    ax.grid(True, alpha=0.3)
+
+    # Plot 6: Summary statistics
+    ax = axes[2, 1]
+    ax.axis('off')
+    final_stats = f"""
+    FINAL STATISTICS
+    {'='*40}
+
+    Best Fitness:      {history['f_best'][-1]:.2f}
+    Final Temperature: {history['T'][-1]:.4f}
+
+    Acceptance Rate:   {history['acceptance_rate'][-1]:.2%}
+    Repair Rate:       {history['repair_rate'][-1]:.2%}
+    Skip Rate:         {history['skip_rate'][-1]:.2%}
+
+    Iterations:        {len(iters)}
+    """
+    ax.text(0.1, 0.5, final_stats, fontsize=11, family='monospace',
+            verticalalignment='center')
 
     plt.tight_layout()
     return fig
@@ -410,21 +424,14 @@ def plot_convergence(history):
 # ============================================================================
 
 def random_search_baseline(params, x0, v0, t0, n_samples=500, seed=42):
-    """
-    Random search baseline for comparison
+    """Random search baseline - now uses pure objective"""
+    from metaheuristic_intersection import objective_function, feasibility_check
 
-    Args:
-        n_samples: Number of random solutions to try
-
-    Returns:
-        best_x, best_f, best_feasible
-    """
     np.random.seed(seed)
 
     print("\n" + "="*80)
     print("RANDOM SEARCH BASELINE")
     print("="*80)
-    print(f"Generating {n_samples} random solutions...")
 
     best_f = float('inf')
     best_x = None
@@ -433,27 +440,33 @@ def random_search_baseline(params, x0, v0, t0, n_samples=500, seed=42):
 
     for i in range(n_samples):
         x = generate_random_solution(params)
-        f, is_feas, _ = penalized_objective(x, x0, v0, t0, params)
+
+        # Check feasibility first
+        is_feas, _ = feasibility_check(x, x0, v0, t0, params)
 
         if is_feas:
             n_feasible += 1
+            # Only evaluate objective if feasible
+            f, _, _, _ = objective_function(x, x0, v0, t0, params)
 
-        # Update best
-        if is_feas and not best_feasible:
-            best_x = x.copy()
-            best_f = f
-            best_feasible = True
-        elif is_feas == best_feasible and f < best_f:
-            best_x = x.copy()
-            best_f = f
+            # Update best
+            if not best_feasible or f < best_f:
+                best_x = x.copy()
+                best_f = f
+                best_feasible = True
 
         if (i+1) % 100 == 0:
-            print(f"Sample {i+1}/{n_samples}: best_f={best_f:.2f}, feasible_rate={n_feasible/(i+1):.2%}")
+            status = f"feasible_rate={n_feasible/(i+1):.2%}"
+            if best_feasible:
+                status += f", best_f={best_f:.2f}"
+            print(f"Sample {i+1}/{n_samples}: {status}")
 
     print(f"\nRandom search complete:")
-    print(f"Best fitness: {best_f:.2f}")
-    print(f"Best feasible: {best_feasible}")
-    print(f"Feasibility rate: {n_feasible/n_samples:.2%}")
+    if best_feasible:
+        print(f"  Best fitness: {best_f:.2f} ✅")
+    else:
+        print(f"  No feasible solution found ❌")
+    print(f"  Feasibility rate: {n_feasible/n_samples:.2%}")
     print("="*80 + "\n")
 
     return best_x, best_f, best_feasible

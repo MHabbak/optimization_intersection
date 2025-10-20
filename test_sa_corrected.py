@@ -38,7 +38,7 @@ if __name__ == "__main__":
 
     x_best, f_best, history = simulated_annealing(
         params, x0, v0, t0,
-        T_init=500.0,
+        T_init=100.0,      # Lower temp = more selective
         T_final=0.01,
         max_iter=5000,
         seed=42

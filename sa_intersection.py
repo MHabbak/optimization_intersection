@@ -25,17 +25,15 @@ def repair_solution(x_infeasible: np.ndarray,
                    v0: np.ndarray,
                    t0: np.ndarray) -> np.ndarray:
     """
-    Repair infeasible solution by fixing violations
+    IMPROVED repair operator with targeted fixes
 
-    Heuristics:
-    1. Velocity violations → reduce accelerations by 20%
-    2. Collision violations → flip priority variables
-    3. Reaching violations → increase accelerations by 20%
-    4. Acceleration violations → clip to bounds
-
-    Returns:
-        x_repaired: Repaired solution (hopefully feasible)
+    Strategy:
+    1. Velocity violations → smooth accelerations to stay within bounds
+    2. Collision violations → create time gaps by adjusting speeds
+    3. Reaching violations → ensure sufficient forward acceleration
     """
+    from metaheuristic_intersection import feasibility_check
+
     x_repaired = x_infeasible.copy()
     N, K = params.N, params.K
 
@@ -43,48 +41,83 @@ def repair_solution(x_infeasible: np.ndarray,
     u_profiles = x_repaired[:N*K].reshape(N, K)
     Z_binary = x_repaired[N*K:] if len(x_repaired) > N*K else np.array([])
 
-    # Parse violations dictionary
+    # Count violation types
+    has_velocity_viol = False
+    has_collision_viol = False
+    has_reaching_viol = False
+
+    # Parse violations
     for constraint_type, result in violations.items():
         if not result.get('satisfied', True):
-            constraint_violations = result.get('violations', [])
+            if 'velocity' in constraint_type.lower():
+                has_velocity_viol = True
+            elif 'collision' in constraint_type.lower() or 'lateral' in constraint_type.lower():
+                has_collision_viol = True
+            elif 'reaching' in constraint_type.lower():
+                has_reaching_viol = True
 
-            for v in constraint_violations:
-                v_type = v.get('type', constraint_type)
+    # REPAIR STRATEGY 1: Fix velocity violations by smoothing
+    if has_velocity_viol:
+        for i in range(N):
+            # Apply moving average filter to smooth accelerations
+            window = 5
+            u_smooth = np.convolve(u_profiles[i], np.ones(window)/window, mode='same')
+            u_profiles[i] = u_smooth * 0.7  # Scale down to stay in bounds
+            u_profiles[i] = np.clip(u_profiles[i], params.u_min, params.u_max)
 
-                # Fix velocity limit violations
-                if 'velocity' in v_type.lower():
-                    vehicle = v.get('vehicle', v.get('i', 0))
-                    # Reduce accelerations by 20%
-                    u_profiles[vehicle] *= 0.8
-                    u_profiles[vehicle] = np.clip(u_profiles[vehicle],
-                                                 params.u_min, params.u_max)
+    # REPAIR STRATEGY 2: Fix collisions by creating time separation
+    if has_collision_viol:
+        # Slow down some vehicles, speed up others to create gaps
+        for i in range(N):
+            if i % 2 == 0:
+                # Even vehicles: slow down in merge zone
+                merge_start_idx = int((params.L - params.S) / (v0[i] * params.dt))
+                merge_start_idx = max(0, min(merge_start_idx, K-10))
+                u_profiles[i, merge_start_idx:merge_start_idx+10] *= 0.5
+            else:
+                # Odd vehicles: speed up before merge zone
+                pre_merge_idx = max(0, int((params.L - params.S - 20) / (v0[i] * params.dt)))
+                pre_merge_idx = min(pre_merge_idx, K-10)
+                u_profiles[i, pre_merge_idx:pre_merge_idx+5] *= 1.3
 
-                # Fix collision violations
-                elif 'collision' in v_type.lower() or 'lateral' in v_type.lower():
-                    # Flip a random priority variable
-                    if len(Z_binary) > 0:
-                        idx = np.random.randint(0, len(Z_binary))
-                        Z_binary[idx] = 1.0 - Z_binary[idx]
+        # Clip to bounds
+        u_profiles = np.clip(u_profiles, params.u_min, params.u_max)
 
-                # Fix reaching zone violations
-                elif 'reaching' in v_type.lower():
-                    vehicle = v.get('vehicle', v.get('i', 0))
-                    # Increase accelerations by 20%
-                    u_profiles[vehicle] *= 1.2
-                    u_profiles[vehicle] = np.clip(u_profiles[vehicle],
-                                                 params.u_min, params.u_max)
+        # Also flip priorities to change crossing order
+        if len(Z_binary) > 0:
+            flip_idx = np.random.randint(0, len(Z_binary))
+            Z_binary[flip_idx] = 1.0 - Z_binary[flip_idx]
 
-                # Fix acceleration limit violations
-                elif 'acceleration' in v_type.lower():
-                    vehicle = v.get('vehicle', v.get('i', 0))
-                    u_profiles[vehicle] = np.clip(u_profiles[vehicle],
-                                                 params.u_min, params.u_max)
+    # REPAIR STRATEGY 3: Fix reaching violations by boosting forward motion
+    if has_reaching_viol:
+        for i in range(N):
+            # Increase all accelerations to ensure reaching goal
+            u_profiles[i] *= 1.5
+            u_profiles[i] = np.clip(u_profiles[i], 0.0, params.u_max)  # Only positive
 
     # Reconstruct solution
     if len(Z_binary) > 0:
         x_repaired = np.concatenate([u_profiles.flatten(), Z_binary])
     else:
         x_repaired = u_profiles.flatten()
+
+    # Verify repair worked (at least partially)
+    is_feas_after, _ = feasibility_check(x_repaired, x0, v0, t0, params)
+
+    if not is_feas_after:
+        # If still infeasible, try more aggressive repair
+        # Strategy: blend with known-good conservative solution
+        u_conservative = np.ones((N, K)) * 0.3  # Very gentle acceleration
+        u_conservative = np.clip(u_conservative, params.u_min, params.u_max)
+
+        # Blend 70% conservative, 30% current
+        u_blended = 0.7 * u_conservative + 0.3 * u_profiles
+        u_blended = np.clip(u_blended, params.u_min, params.u_max)
+
+        if len(Z_binary) > 0:
+            x_repaired = np.concatenate([u_blended.flatten(), Z_binary])
+        else:
+            x_repaired = u_blended.flatten()
 
     return x_repaired
 
@@ -115,12 +148,38 @@ def generate_initial_feasible_solution(params, x0, v0, t0, max_attempts=1000):
             print(f"✅ Found initial feasible solution on attempt {attempt + 1}")
             return x
 
-    # If failed, return very conservative solution
-    print("⚠️  Using conservative fallback initial solution")
-    u_conservative = np.ones((params.N, params.K)) * 0.5  # Gentle acceleration
+    # If failed, return VERY conservative solution
+    print("⚠️  Using ultra-conservative fallback initial solution")
+
+    # Strategy: Very gentle constant acceleration to slowly reach goal
+    # Each vehicle accelerates gently, no conflicts
+    u_conservative = np.zeros((params.N, params.K))
+
+    for i in range(params.N):
+        # Gentle acceleration for first 20 steps to reach decent speed
+        u_conservative[i, :20] = 0.5  # Gentle accel
+        # Then coast (zero acceleration)
+        u_conservative[i, 20:] = 0.0
+
     u_conservative = np.clip(u_conservative, params.u_min, params.u_max)
-    Z_conservative = np.array([1.0, 1.0, 0.0, 0.0])  # Sequential priorities
-    return np.concatenate([u_conservative.flatten(), Z_conservative])
+
+    # Sequential priorities (vehicles go one by one)
+    Z_conservative = np.array([1.0, 1.0, 0.0, 0.0])
+
+    x_conservative = np.concatenate([u_conservative.flatten(), Z_conservative])
+
+    # VERIFY this is actually feasible
+    from metaheuristic_intersection import feasibility_check
+    is_feas, viols = feasibility_check(x_conservative, x0, v0, t0, params)
+
+    if is_feas:
+        print("✅ Conservative solution is feasible")
+    else:
+        print("❌ WARNING: Even conservative solution is infeasible!")
+        violated_constraints = [k for k, v in viols.items() if not v['satisfied']]
+        print(f"   Violations: {violated_constraints}")
+
+    return x_conservative
 
 
 # ============================================================================
@@ -167,7 +226,7 @@ def generate_neighbor(x_current, params, T, T_init):
 # ============================================================================
 
 def simulated_annealing(params, x0, v0, t0,
-                       T_init=500.0,
+                       T_init=100.0,
                        T_final=0.01,
                        max_iter=5000,
                        seed=42):
@@ -256,6 +315,13 @@ def simulated_annealing(params, x0, v0, t0,
             # If still infeasible after repair, skip this iteration
             if not is_feas:
                 n_skipped += 1
+
+                # DEBUG: Print why it's failing (only first 10 times)
+                if n_skipped <= 10:
+                    violated_constraints = [k for k, v in violations.items() if not v['satisfied']]
+                    print(f"  [Iter {iteration}] Skipped - still infeasible after repair")
+                    print(f"    Violations: {violated_constraints}")
+
                 # Still cool the temperature
                 T = T_init - beta * iteration
 
@@ -1138,8 +1204,10 @@ if __name__ == "__main__":
         # SA
         x_best, f_best, history = simulated_annealing(
             params, x0, v0, t0,
-            T_init=1000.0, T_final=1.0, cooling=0.95,
-            max_iter=5000, seed=42
+            T_init=100.0,      # Lower initial temp
+            T_final=0.01,
+            max_iter=5000,
+            seed=42
         )
 
         # Plot convergence

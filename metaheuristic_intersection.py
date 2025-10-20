@@ -21,8 +21,8 @@ class ProblemParameters:
 
     # Time discretization - EXTENDED to remove artificial time constraint
     dt: float = 0.5            # Time step (seconds) - [0.1-0.5 typical]
-    K: int = 200               # Maximum time steps (safety limit)
-    T_max: float = 100.0       # Maximum time horizon (seconds, safety limit)
+    K: int = 100               # Maximum time steps (safety limit)
+    T_max: float = 50.0        # Maximum time horizon (seconds, safety limit)
 
     # NOTE: T_max is now an upper bound for simulation, not a hard constraint.
     # The objective function measures actual crossing time, which can be much less.

@@ -48,8 +48,7 @@ class ProblemParameters:
     M: float = 1000.0           # Big-M constant for MILP formulation
 
     # Objective function weights
-    alpha: float = 0.7         # Time weight (0 to 1)
-    # Note: Energy weight is (1 - alpha)
+    weights = [1,3]       
 
     def __post_init__(self):
         """Validate parameters after initialization"""
@@ -81,11 +80,11 @@ class ProblemParameters:
                 f"u_min ({self.u_min}) must be less than u_max ({self.u_max})"
             )
 
-        # Check alpha weight is valid
-        if not (0 <= self.alpha <= 1):
-            raise ValueError(
-                f"alpha ({self.alpha}) must be between 0 and 1"
-            )
+        # # Check alpha weight is valid
+        # if not (0 <= self.weights[1] <= 1):
+        #     raise ValueError(
+        #         f"alpha ({self.alpha}) must be between 0 and 1"
+        #     )
 
         # Check geometric parameters
         if self.S > self.L:
@@ -237,7 +236,8 @@ def objective_function(x_decision: np.ndarray,
     """
     N = params.N
     dt = params.dt
-    alpha = params.alpha
+    w_t = params.weights[0]
+    w_f = params.weights[1]
     L = params.L
 
     # Extract acceleration profiles (use first K values, will be adaptively truncated)
@@ -284,7 +284,7 @@ def objective_function(x_decision: np.ndarray,
         f_energy += np.sum(u_actual ** 2) * dt
 
     # Combined objective
-    f_total = alpha * f_time + (1 - alpha) * f_energy
+    f_total = w_t * f_time +  w_f* f_energy
 
     info = {
         'all_completed': True,
@@ -1703,9 +1703,9 @@ if __name__ == "__main__":
     print(f"Velocity limits: [{params.v_min}, {params.v_max}] m/s (no stopping in intersection)")
     print(f"Control zone: L={params.L}m, Merging zone: S={params.S}m")
     print(f"Safety distance: delta={params.delta}m, Time separation: dt_safe={params.dt_safe}s")
-    print(f"\nObjective: alpha={params.alpha} (time weight)")
-    print(f"  - Time component weight: {params.alpha}")
-    print(f"  - Energy component weight: {1-params.alpha}")
+    # print(f"\nObjective: alpha={params.alpha} (time weight)")
+    print(f"  - Time component weight: {params.weights[0]}")
+    print(f"  - Energy component weight: {params.weights[1]}")
 
     # Decision vector dimensions
     n_conflicts = np.sum(params.get_conflict_matrix()) // 2

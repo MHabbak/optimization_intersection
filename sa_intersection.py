@@ -1137,7 +1137,7 @@ if __name__ == "__main__":
         x_best, f_best, history = simulated_annealing(
             params, x0, v0, t0,
             T_init=1000.0,
-            T_final=0.01,
+            T_final=0.1,
             max_iter=1000
         )
 

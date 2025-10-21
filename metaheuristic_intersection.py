@@ -34,7 +34,7 @@ class ProblemParameters:
     u_max: float = 3.0         # Max acceleration (typical vehicle)
 
     # Velocity limits (m/s)
-    v_min: float = 5.0         # Min velocity in intersection (no stopping)
+    v_min: float = 1.0         # Min velocity in intersection (no stopping)
     v_max: float = 20.0        # Max velocity
     v_min_approach: float = 0.0  # Min velocity before intersection
 
@@ -312,7 +312,7 @@ def check_constraint_1_dynamics(trajectories: List, u_profiles: np.ndarray,
                                 x0: np.ndarray, v0: np.ndarray, 
                                 params: ProblemParameters) -> Dict:
     """
-    Constraint 1: Vehicle dynamics
+    Constraint 1: Vehicle dynamics0
     
     xᵢ[k+1] = xᵢ[k] + vᵢ[k]·Δt + 0.5·uᵢ[k]·Δt²
     vᵢ[k+1] = vᵢ[k] + uᵢ[k]·Δt
@@ -482,14 +482,14 @@ def check_constraint_5_reaching_zones(trajectories: List, params: ProblemParamet
 
     for i, (x_traj, v_traj) in enumerate(trajectories):
         # Check 1: Reaches merging zone
-        reaches_merge = np.any(x_traj >= (params.L - params.S))
+        reaches_merge = np.any(x_traj >= (params.L))
         if not reaches_merge:
             violations.append({
                 'vehicle': i,
                 'type': 'does_not_reach_merging_zone',
                 'max_position': np.max(x_traj),
-                'target': params.L - params.S,
-                'deficit': (params.L - params.S) - np.max(x_traj),
+                'target': params.L,
+                'deficit': (params.L) - np.max(x_traj),
                 'note': f'Vehicle did not reach merge zone even with {params.T_max}s horizon'
             })
 
@@ -501,7 +501,7 @@ def check_constraint_5_reaching_zones(trajectories: List, params: ProblemParamet
                 'type': 'does_not_reach_exit',
                 'max_position': np.max(x_traj),
                 'target': params.L,
-                'deficit': params.L - np.max(x_traj),
+                'deficit': (params.L) - np.max(x_traj),
                 'note': f'Vehicle did not complete crossing even with {params.T_max}s horizon'
             })
 
@@ -760,17 +760,17 @@ def check_constraint_7_lateral_collision(trajectories: List,
                 x_j, v_j = trajectories[j]
 
                 # Entry time to merging zone (x >= L - S)
-                idx_i = np.where(x_i >= params.L - params.S)[0]
+                idx_i = np.where(x_i >= params.L)[0]
                 t_m_i = t0[i] + (idx_i[0] * params.dt if len(idx_i) > 0 else np.inf)
 
-                idx_j = np.where(x_j >= params.L - params.S)[0]
+                idx_j = np.where(x_j >= params.L)[0]
                 t_m_j = t0[j] + (idx_j[0] * params.dt if len(idx_j) > 0 else np.inf)
 
                 # Exit time from merging zone (x >= L)
-                idx_exit_i = np.where(x_i >= params.L)[0]
+                idx_exit_i = np.where(x_i >= params.L + params.S)[0]
                 t_f_i = t0[i] + (idx_exit_i[0] * params.dt if len(idx_exit_i) > 0 else np.inf)
 
-                idx_exit_j = np.where(x_j >= params.L)[0]
+                idx_exit_j = np.where(x_j >= params.L + params.S)[0]
                 t_f_j = t0[j] + (idx_exit_j[0] * params.dt if len(idx_exit_j) > 0 else np.inf)
 
                 # Safety time buffer
@@ -779,8 +779,8 @@ def check_constraint_7_lateral_collision(trajectories: List,
                 # Check priority constraint based on ROUNDED Z value
                 if z_ij >= 0.5:
                     # Vehicle i has priority (should exit before j enters)
-                    required = t_f_i + crossing_time <= t_m_j
-                    gap = t_m_j - (t_f_i + crossing_time)
+                    required = t_f_i + crossing_time <= t_f_j + crossing_time
+                    gap = t_f_j + crossing_time - (t_f_i + crossing_time)
 
                     if not required:
                         violations.append({

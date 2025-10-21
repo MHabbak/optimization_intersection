@@ -230,178 +230,125 @@ def generate_neighbor(x_current, params, T, T_init):
 def simulated_annealing(params, x0, v0, t0,
                        T_init=100.0,
                        T_final=0.01,
-                       max_iter=5,
-                       seed=42):
+                       max_iter=5000):
     """
-    Simulated Annealing with THREE FIXES:
-    1. Variable time horizon (adaptive K)
-    2. Repair operator (guaranteed feasibility)
-    3. Linear cooling (matches lecture)
-
-    Args:
-        params: Problem parameters
-        x0, v0, t0: Initial conditions
-        T_init: Initial temperature
-        T_final: Final temperature
-        max_iter: Maximum iterations
-        seed: Random seed
-
-    Returns:
-        x_best: Best feasible solution found
-        f_best: Best objective value
-        history: Convergence history
+    Simulated Annealing with guaranteed feasible solutions.
+    - Linear cooling
+    - Feasible repair mechanism
+    - Safe convergence logging
     """
+    import numpy as np
     from metaheuristic_intersection import objective_function, feasibility_check
 
-    np.random.seed(seed)
 
-    # Calculate LINEAR cooling rate (matches lecture)
+    # Linear cooling step
     beta = (T_init - T_final) / max_iter
 
-    # Initialize with FEASIBLE solution
     print("\n" + "="*80)
-    print("SIMULATED ANNEALING - MILESTONE 3 (CORRECTED)")
+    print("SIMULATED ANNEALING - GUARANTEED FEASIBLE VERSION")
     print("="*80)
     print("Generating initial feasible solution...")
 
+    # 1️⃣ Initial feasible solution
     x_current = generate_initial_feasible_solution(params, x0, v0, t0)
     f_current, f_time_current, f_energy_current, _ = objective_function(
         x_current, x0, v0, t0, params
     )
 
-    # Track best
     x_best = x_current.copy()
     f_best = f_current
 
-    # History
+    # 2️⃣ Counters and logs
+    n_accepted = 0
+    n_repaired = 0
+    T = T_init
+
     history = {
         'iteration': [],
         'f_best': [],
         'f_current': [],
         'T': [],
         'acceptance_rate': [],
-        'repair_rate': [],
-        'skip_rate': []
+        'repairs_per_iter': []
     }
-
-    # Counters
-    n_accepted = 0
-    n_repaired = 0
-    n_skipped = 0
-    T = T_init
 
     print(f"\n✅ Initial feasible solution found")
     print(f"   Fitness: {f_current:.2f} (time={f_time_current:.2f}, energy={f_energy_current:.2f})")
-    print(f"\nSA Parameters:")
-    print(f"   T_init = {T_init}, T_final = {T_final}")
-    print(f"   Cooling: LINEAR with β = {beta:.6f}")
-    print(f"   Max iterations: {max_iter}")
-    print("="*80 + "\n")
+    print(f"   Cooling: linear (β = {beta:.6f})\n")
 
-    # Main SA loop
+    # 3️⃣ MAIN LOOP
     for iteration in range(max_iter):
         # Generate neighbor
         x_neighbor = generate_neighbor(x_current, params, T, T_init)
 
-        # Check feasibility
+        # Enforce feasibility with limited repairs
+        repairs_this_iter = 0
         is_feas, violations = feasibility_check(x_neighbor, x0, v0, t0, params)
+        repair_attempts = 0
 
-        # Repair if infeasible
-        if not is_feas:
+        while not is_feas and repair_attempts < 20:
             x_neighbor = repair_solution(x_neighbor, violations, params, x0, v0, t0)
             n_repaired += 1
-
-            # Re-check after repair
+            repairs_this_iter += 1
+            repair_attempts += 1
             is_feas, violations = feasibility_check(x_neighbor, x0, v0, t0, params)
 
-            # If still infeasible after repair, skip this iteration
-            if not is_feas:
-                n_skipped += 1
+        # If still infeasible after 20 repairs, skip this neighbor
+        if not is_feas:
+            continue
 
-                # DEBUG: Print why it's failing (only first 10 times)
-                if n_skipped <= 10:
-                    violated_constraints = [k for k, v in violations.items() if not v['satisfied']]
-                    print(f"  [Iter {iteration}] Skipped - still infeasible after repair")
-                    print(f"    Violations: {violated_constraints}")
-
-                # Still cool the temperature
-                T = T_init - beta * iteration
-
-                # Update history with current values
-                history['iteration'].append(iteration)
-                history['f_best'].append(f_best)
-                history['f_current'].append(f_current)
-                history['T'].append(T)
-                history['acceptance_rate'].append(n_accepted / (iteration + 1))
-                history['repair_rate'].append(n_repaired / (iteration + 1))
-                history['skip_rate'].append(n_skipped / (iteration + 1))
-                continue
-
-        # Evaluate feasible neighbor (NO PENALTIES, pure objective)
+        # Evaluate
         f_neighbor, f_time_neighbor, f_energy_neighbor, _ = objective_function(
             x_neighbor, x0, v0, t0, params
         )
 
-        # Acceptance criterion (standard Metropolis)
+        # Metropolis acceptance
         delta_f = f_neighbor - f_current
-
         if delta_f < 0:
-            # Always accept improvement
             accept = True
         else:
-            # Accept worse solution with probability exp(-ΔE/T)
-            prob_accept = np.exp(-delta_f / T)
-            accept = (np.random.random() < prob_accept)
+            prob_accept = np.exp(-delta_f / max(T, 1e-6))
+            accept = np.random.random() < prob_accept
 
-        # Update current solution
         if accept:
             x_current = x_neighbor.copy()
             f_current = f_neighbor
             n_accepted += 1
 
-        # Update best solution
+        # Update best
         if f_neighbor < f_best:
             x_best = x_neighbor.copy()
             f_best = f_neighbor
 
-        # LINEAR COOLING (matches lecture formula: T_i = T_0 - β*i)
-        T = T_init - beta * iteration
+        # Update temperature (linear schedule)
+        T = max(T_init - beta * (iteration + 1), T_final)
 
-        # Update history
+        # Log
         history['iteration'].append(iteration)
         history['f_best'].append(f_best)
         history['f_current'].append(f_current)
         history['T'].append(T)
         history['acceptance_rate'].append(n_accepted / (iteration + 1))
-        history['repair_rate'].append(n_repaired / (iteration + 1))
-        history['skip_rate'].append(n_skipped / (iteration + 1))
+        history['repairs_per_iter'].append(repairs_this_iter)
 
-        # Progress reporting
-        if iteration % 10 == 0:
-            print(f"Iter {iteration:4d}: f_best={f_best:7.2f}, f_current={f_current:7.2f}, "
-                  f"T={T:6.2f}, accept={n_accepted/(iteration+1):5.1%}, "
-                  f"repair={n_repaired/(iteration+1):5.1%}, skip={n_skipped/(iteration+1):5.1%}")
+        # Progress print
+        if iteration % 10 == 0 or iteration == max_iter - 1:
+            print(f"Iter {iteration:4d}: f_best={f_best:7.2f}, "
+                  f"f_current={f_current:7.2f}, T={T:7.3f}, "
+                  f"accept={n_accepted/(iteration+1):5.1%}, "
+                  f"repairs/iter={repairs_this_iter}")
 
-        # Stop if temperature too low
-        if T <= T_final:
-            print(f"\n✅ Reached T_final={T_final} at iteration {iteration}")
-            break
-
-    # Final verification
+    # 4️⃣ Final feasibility check
     is_feas_final, _ = feasibility_check(x_best, x0, v0, t0, params)
 
     print("\n" + "="*80)
-    print("SA COMPLETE")
+    print("SIMULATED ANNEALING COMPLETE")
     print("="*80)
-    print(f"Best fitness:      {f_best:.2f}")
-    print(f"Final feasibility: {'✅ FEASIBLE' if is_feas_final else '❌ INFEASIBLE'}")
-    print(f"Acceptance rate:   {n_accepted/iteration:.2%}")
-    print(f"Repair rate:       {n_repaired/iteration:.2%}")
-    print(f"Skip rate:         {n_skipped/iteration:.2%}")
+    print(f"Best fitness:           {f_best:.2f}")
+    print(f"Final feasibility:      {'✅ FEASIBLE' if is_feas_final else '❌ INFEASIBLE'}")
+    print(f"Acceptance rate:        {n_accepted / max(1, len(history['iteration'])):.2%}")
+    print(f"Avg repairs per iter:   {n_repaired / max(1, len(history['iteration'])):.2f}")
     print("="*80 + "\n")
-
-    if not is_feas_final:
-        print("⚠️  WARNING: Best solution is INFEASIBLE - increase max_iter or adjust repair")
 
     return x_best, f_best, history
 
@@ -410,92 +357,78 @@ def simulated_annealing(params, x0, v0, t0,
 # VISUALIZATION
 # ============================================================================
 
-def plot_convergence(history):
-    """Plot SA convergence history with repair tracking"""
-    fig, axes = plt.subplots(3, 2, figsize=(14, 12))
-    fig.suptitle('Simulated Annealing Convergence (Corrected)', fontsize=14, fontweight='bold')
+import matplotlib.pyplot as plt
 
+def plot_convergence(history):
+    """
+    Plot convergence trends for Simulated Annealing:
+    - Best and current fitness values
+    - Temperature cooling curve
+    - Acceptance rate evolution
+    - Repairs per iteration
+
+    Args:
+        history (dict): Convergence log returned by simulated_annealing()
+    """
     iters = history['iteration']
 
-    # Plot 1: Objective value
-    ax = axes[0, 0]
-    ax.plot(iters, history['f_best'], 'g-', linewidth=2, label='Best')
-    ax.plot(iters, history['f_current'], 'b-', alpha=0.5, label='Current')
-    ax.set_xlabel('Iteration')
-    ax.set_ylabel('Fitness (Pure Objective)')
-    ax.set_title('Objective Function Value')
-    ax.legend()
-    ax.grid(True, alpha=0.3)
+    fig, axs = plt.subplots(2, 2, figsize=(12, 8))
+    fig.suptitle("Simulated Annealing Convergence", fontsize=14, fontweight='bold')
 
-    # Plot 2: Temperature
-    ax = axes[0, 1]
+    # === 1️⃣ Fitness Evolution ===
+    ax = axs[0, 0]
+    ax.plot(iters, history['f_best'], 'b-', linewidth=2, label='Best Fitness')
+    ax.plot(iters, history['f_current'], 'orange', linewidth=1.5, label='Current Fitness')
+    ax.set_xlabel("Iteration")
+    ax.set_ylabel("Objective Value")
+    ax.set_title("Fitness Evolution")
+    ax.legend()
+    ax.grid(True, linestyle='--', alpha=0.6)
+
+    # === 2️⃣ Temperature Cooling ===
+    ax = axs[0, 1]
     ax.plot(iters, history['T'], 'r-', linewidth=2)
-    ax.set_xlabel('Iteration')
-    ax.set_ylabel('Temperature')
-    ax.set_title('Cooling Schedule (LINEAR)')
-    ax.grid(True, alpha=0.3)
+    ax.set_xlabel("Iteration")
+    ax.set_ylabel("Temperature (T)")
+    ax.set_title("Cooling Schedule")
+    ax.grid(True, linestyle='--', alpha=0.6)
 
-    # Plot 3: Acceptance rate
-    ax = axes[1, 0]
-    ax.plot(iters, [r*100 for r in history['acceptance_rate']], 'orange', linewidth=2)
-    ax.set_xlabel('Iteration')
-    ax.set_ylabel('Acceptance Rate (%)')
-    ax.set_title('Solution Acceptance Rate')
-    ax.grid(True, alpha=0.3)
+    # === 3️⃣ Acceptance Rate ===
+    ax = axs[1, 0]
+    ax.plot(iters, [a * 100 for a in history['acceptance_rate']], 'g-', linewidth=2)
+    ax.set_xlabel("Iteration")
+    ax.set_ylabel("Acceptance Rate (%)")
+    ax.set_title("Acceptance Rate Over Time")
+    ax.grid(True, linestyle='--', alpha=0.6)
 
-    # Plot 4: Repair rate
-    ax = axes[1, 1]
-    ax.plot(iters, [r*100 for r in history['repair_rate']], 'purple', linewidth=2, label='Repair')
-    ax.plot(iters, [r*100 for r in history['skip_rate']], 'red', linewidth=2, label='Skip')
-    ax.set_xlabel('Iteration')
-    ax.set_ylabel('Rate (%)')
-    ax.set_title('Repair & Skip Rates')
-    ax.legend()
-    ax.grid(True, alpha=0.3)
+    # === 4️⃣ Repairs per Iteration ===
+    ax = axs[1, 1]
+    if 'repairs_per_iter' in history:
+        ax.plot(iters, history['repairs_per_iter'], 'purple', linewidth=2, label='Repairs per Iteration')
+        ax.set_ylabel("Repairs per Iteration")
+    elif 'repair_rate' in history:  # backward compatibility
+        ax.plot(iters, [r * 100 for r in history['repair_rate']], 'purple', linewidth=2, label='Repair (%)')
+        ax.set_ylabel("Repair Rate (%)")
+    else:
+        ax.text(0.5, 0.5, "No repair data", ha='center', va='center', fontsize=12, color='gray')
+    ax.set_xlabel("Iteration")
+    ax.set_title("Repair Effort")
+    ax.grid(True, linestyle='--', alpha=0.6)
 
-    # Plot 5: Temperature vs Best Fitness (trajectory)
-    ax = axes[2, 0]
-    scatter = ax.scatter(history['T'], history['f_best'],
-                        c=iters, cmap='viridis', s=2, alpha=0.6)
-    ax.set_xlabel('Temperature')
-    ax.set_ylabel('Best Fitness')
-    ax.set_title('Fitness vs Temperature')
-    ax.set_xscale('log')
-    plt.colorbar(scatter, ax=ax, label='Iteration')
-    ax.grid(True, alpha=0.3)
+    plt.tight_layout(rect=[0, 0, 1, 0.96])
+    plt.show()
 
-    # Plot 6: Summary statistics
-    ax = axes[2, 1]
-    ax.axis('off')
-    final_stats = f"""
-    FINAL STATISTICS
-    {'='*40}
-
-    Best Fitness:      {history['f_best'][-1]:.2f}
-    Final Temperature: {history['T'][-1]:.4f}
-
-    Acceptance Rate:   {history['acceptance_rate'][-1]:.2%}
-    Repair Rate:       {history['repair_rate'][-1]:.2%}
-    Skip Rate:         {history['skip_rate'][-1]:.2%}
-
-    Iterations:        {len(iters)}
-    """
-    ax.text(0.1, 0.5, final_stats, fontsize=11, family='monospace',
-            verticalalignment='center')
-
-    plt.tight_layout()
     return fig
+
 
 
 # ============================================================================
 # RANDOM SEARCH BASELINE (for comparison)
 # ============================================================================
 
-def random_search_baseline(params, x0, v0, t0, n_samples=500, seed=42):
+def random_search_baseline(params, x0, v0, t0, n_samples=500):
     """Random search baseline - now uses pure objective"""
     from metaheuristic_intersection import objective_function, feasibility_check
-
-    np.random.seed(seed)
 
     print("\n" + "="*80)
     print("RANDOM SEARCH BASELINE")
@@ -741,7 +674,6 @@ def simulated_annealing_with_live_viz(params, x0, v0, t0,
                                       T_final=1.0,
                                       cooling=0.95,
                                       max_iter=5000,
-                                      seed=42,
                                       update_interval=100):
     """
     SA with LIVE VISUALIZATION - shows algorithm working in real-time
@@ -749,8 +681,6 @@ def simulated_annealing_with_live_viz(params, x0, v0, t0,
     This creates a figure that updates every `update_interval` iterations
     showing the search process as it happens.
     """
-    np.random.seed(seed)
-
     # Initialize
     x_current = generate_random_solution(params)
     f_current, is_feas_current, info_current = penalized_objective(
@@ -880,7 +810,6 @@ def parametric_study_cooling_rate(params, x0, v0, t0):
             T_final=1.0,
             cooling=alpha,
             max_iter=5000,
-            seed=42
         )
 
         results.append({
@@ -960,7 +889,6 @@ def parametric_study_temperature(params, x0, v0, t0):
             T_final=1.0,
             cooling=0.95,
             max_iter=5000,
-            seed=42
         )
 
         results.append({
@@ -994,31 +922,32 @@ def parametric_study_temperature(params, x0, v0, t0):
 
 def statistical_validation(params, x0, v0, t0, n_runs=10):
     """
-    Run SA multiple times with different seeds
-    Report mean, std, best, worst
+    Run SA multiple times with different random initializations
+    Report mean, std, best, worst.
+    (No fixed seeds — results will vary across runs)
     """
     print("\n" + "="*80)
-    print(f"STATISTICAL VALIDATION: {n_runs} Independent Runs")
+    print(f"STATISTICAL VALIDATION: {n_runs} Independent Runs (non-deterministic)")
     print("="*80)
 
     results = []
 
     for run in range(n_runs):
-        print(f"\nRun {run+1}/{n_runs} (seed={run})")
+        print(f"\nRun {run+1}/{n_runs}")
 
+        # Each SA run uses natural randomness 
         x_best, f_best, history = simulated_annealing(
             params, x0, v0, t0,
             T_init=1000.0,
             T_final=1.0,
-            cooling=0.95,
             max_iter=5000,
-            seed=run
         )
 
+        # Evaluate final solution
         _, is_feas, info = penalized_objective(x_best, x0, v0, t0, params)
 
         results.append({
-            'seed': run,
+            'run_id': run + 1,
             'f_best': f_best,
             'f_time': info['f_time'],
             'f_energy': info['f_energy'],
@@ -1026,14 +955,17 @@ def statistical_validation(params, x0, v0, t0, n_runs=10):
             'history': history
         })
 
-    # Statistics
+    # =========================
+    # 📊 Statistics summary
+    # =========================
     feasible_results = [r for r in results if r['feasible']]
     all_fitness = [r['f_best'] for r in results]
 
     print("\n" + "="*80)
     print("STATISTICAL SUMMARY")
     print("="*80)
-    print(f"Feasibility rate: {len(feasible_results)}/{n_runs} ({len(feasible_results)/n_runs*100:.1f}%)")
+    print(f"Feasibility rate: {len(feasible_results)}/{n_runs} "
+          f"({len(feasible_results)/n_runs*100:.1f}%)")
 
     if feasible_results:
         feas_fitness = [r['f_best'] for r in feasible_results]
@@ -1050,24 +982,26 @@ def statistical_validation(params, x0, v0, t0, n_runs=10):
     print(f"  Std Dev: {np.std(all_fitness):.2f}")
     print("="*80)
 
-    # Box plot
+    # =========================
+    # 📈 Visualization
+    # =========================
     fig, axes = plt.subplots(1, 2, figsize=(12, 6))
     fig.suptitle(f'Statistical Validation ({n_runs} runs)', fontsize=14, fontweight='bold')
 
-    # Plot 1: All convergence curves
+    # Convergence curves
     ax = axes[0]
     for res in results:
         color = 'green' if res['feasible'] else 'red'
         alpha = 0.7 if res['feasible'] else 0.3
         ax.plot(res['history']['iteration'], res['history']['f_best'],
-               color=color, alpha=alpha, linewidth=1.5)
+                color=color, alpha=alpha, linewidth=1.5)
 
     ax.set_xlabel('Iteration', fontsize=11)
     ax.set_ylabel('Best Fitness', fontsize=11)
     ax.set_title('Convergence: All Runs', fontsize=12)
     ax.grid(True, alpha=0.3)
 
-    # Plot 2: Box plot of final fitness
+    # Box plot of final fitness
     ax = axes[1]
     feas_vals = [r['f_best'] for r in results if r['feasible']]
     infeas_vals = [r['f_best'] for r in results if not r['feasible']]
@@ -1088,6 +1022,7 @@ def statistical_validation(params, x0, v0, t0, n_runs=10):
     plt.show()
 
     return results
+
 
 
 # ============================================================================
@@ -1115,7 +1050,7 @@ def run_comprehensive_m3_demo():
     print("PART 1: Random Search Baseline")
     print("="*80)
     x_random, f_random, feas_random = random_search_baseline(
-        params, x0, v0, t0, n_samples=500, seed=42
+        params, x0, v0, t0, n_samples=500
     )
 
     # Part 2: SA with live visualization
@@ -1125,7 +1060,7 @@ def run_comprehensive_m3_demo():
     x_best, f_best, history, info_best = simulated_annealing_with_live_viz(
         params, x0, v0, t0,
         T_init=1000.0, T_final=1.0, cooling=0.95,
-        max_iter=5000, seed=42, update_interval=100
+        max_iter=5000, update_interval=100
     )
 
     # Part 3: Parametric studies
@@ -1198,18 +1133,12 @@ if __name__ == "__main__":
         v0 = np.array([12.0, 11.0, 13.0, 10.0])
         t0 = np.array([0.0, 0.5, 1.0, 1.5])
 
-        # Baseline
-        x_random, f_random, feas_random = random_search_baseline(
-            params, x0, v0, t0, n_samples=500, seed=42
-        )
-
-        # SA
+        # --- Simulated Annealing only ---
         x_best, f_best, history = simulated_annealing(
             params, x0, v0, t0,
-            T_init=100.0,      # Lower initial temp
+            T_init=1000.0,
             T_final=0.01,
-            max_iter=5000,
-            seed=42
+            max_iter=1000
         )
 
         # Plot convergence

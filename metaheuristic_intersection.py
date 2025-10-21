@@ -21,8 +21,8 @@ class ProblemParameters:
 
     # Time discretization - EXTENDED to remove artificial time constraint
     dt: float = 0.5            # Time step (seconds) - [0.1-0.5 typical]
-    K: int = 100               # Maximum time steps (safety limit)
-    T_max: float = 50.0        # Maximum time horizon (seconds, safety limit)
+    K: int = 200               # Maximum time steps (safety limit)
+    T_max: float = 100.0        # Maximum time horizon (seconds, safety limit)
 
     # NOTE: T_max is now an upper bound for simulation, not a hard constraint.
     # The objective function measures actual crossing time, which can be much less.
@@ -45,10 +45,10 @@ class ProblemParameters:
 
     # Safety parameters
     dt_safe: float = 2.0       # Minimum time separation (seconds)
-    M: float = 500.0           # Big-M constant for MILP formulation
+    M: float = 1000.0           # Big-M constant for MILP formulation
 
     # Objective function weights
-    alpha: float = 0.5         # Time weight (0 to 1)
+    alpha: float = 0.7         # Time weight (0 to 1)
     # Note: Energy weight is (1 - alpha)
 
     def __post_init__(self):
@@ -797,8 +797,8 @@ def check_constraint_7_lateral_collision(trajectories: List,
                         })
                 else:
                     # Vehicle j has priority (z_ij = 0, meaning z_ji = 1)
-                    required = t_f_j + crossing_time <= t_m_i
-                    gap = t_m_i - (t_f_j + crossing_time)
+                    required = t_f_j + crossing_time <= t_f_i + crossing_time/2
+                    gap = t_f_i + crossing_time/2 - (t_f_j + crossing_time)
 
                     if not required:
                         violations.append({

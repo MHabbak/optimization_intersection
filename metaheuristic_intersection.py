@@ -779,8 +779,8 @@ def check_constraint_7_lateral_collision(trajectories: List,
                 # Check priority constraint based on ROUNDED Z value
                 if z_ij >= 0.5:
                     # Vehicle i has priority (should exit before j enters)
-                    required = t_f_i + crossing_time <= t_f_j + crossing_time
-                    gap = t_f_j + crossing_time - (t_f_i + crossing_time)
+                    required = t_f_i + crossing_time <= t_f_j + crossing_time/2
+                    gap = t_f_j + crossing_time/2 - (t_f_i + crossing_time)
 
                     if not required:
                         violations.append({

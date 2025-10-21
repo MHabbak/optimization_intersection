@@ -18,7 +18,7 @@ from metaheuristic_intersection import (
 # REPAIR OPERATOR
 # ============================================================================
 
-
+# max_iter = 6000
 
 def repair_solution(x_infeasible: np.ndarray,
                    violations: Dict,
@@ -230,7 +230,7 @@ def generate_neighbor(x_current, params, T, T_init):
 def simulated_annealing(params, x0, v0, t0,
                        T_init=100.0,
                        T_final=0.01,
-                       max_iter=5000,
+                       max_iter=5,
                        seed=42):
     """
     Simulated Annealing with THREE FIXES:
@@ -377,7 +377,7 @@ def simulated_annealing(params, x0, v0, t0,
         history['skip_rate'].append(n_skipped / (iteration + 1))
 
         # Progress reporting
-        if iteration % 500 == 0:
+        if iteration % 10 == 0:
             print(f"Iter {iteration:4d}: f_best={f_best:7.2f}, f_current={f_current:7.2f}, "
                   f"T={T:6.2f}, accept={n_accepted/(iteration+1):5.1%}, "
                   f"repair={n_repaired/(iteration+1):5.1%}, skip={n_skipped/(iteration+1):5.1%}")

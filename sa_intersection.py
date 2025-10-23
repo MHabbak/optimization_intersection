@@ -8,11 +8,39 @@ Uses FIXED Constraint 6B (conflict-point based, allows simultaneous crossing)
 
 import numpy as np
 import matplotlib.pyplot as plt
-from typing import Dict
+from typing import Dict, Tuple
 from metaheuristic_intersection import (
-    ProblemParameters, objective_function, feasibility_check,
-    generate_random_solution, simulate_vehicle_trajectory
+    make_params,
+    build_spawn_times,
+    build_v0_random,
+    objective_function,
+    feasibility_check,
+    generate_random_solution,
 )
+
+
+def evaluate_solution(
+    x: np.ndarray,
+    x0: np.ndarray, v0: np.ndarray, t0: np.ndarray,
+    params: make_params,
+    base_penalty: float = 1e6
+) -> Tuple[float, bool, Dict]:
+    """
+    Returns (f_total, is_feasible, info).
+    - If feasible: use objective_function(...) (already aligned to stop at x_exit = 2L-S in your main file)
+    - If infeasible: return a large penalty and attach violations so the caller can display them.
+    """
+    is_feas, violations = feasibility_check(x, x0, v0, t0, params)
+    if is_feas:
+        f_time, f_energy, f_total, info = objective_function(x, x0, v0, t0, params)
+        info['violations'] = violations
+        info['is_feasible'] = True
+        return float(f_total), True, info
+
+    # Penalize infeasible solutions (simple, deterministic penalty)
+    info = {'violations': violations, 'is_feasible': False}
+    return float(base_penalty), False, info
+
 
 # ============================================================================
 # REPAIR OPERATOR
@@ -20,168 +48,85 @@ from metaheuristic_intersection import (
 
 # max_iter = 6000
 
-def repair_solution(x_infeasible: np.ndarray,
-                   violations: Dict,
-                   params,
-                   x0: np.ndarray,
-                   v0: np.ndarray,
-                   t0: np.ndarray) -> np.ndarray:
-    """
-    IMPROVED repair operator with targeted fixes
-
-    Strategy:
-    1. Velocity violations → smooth accelerations to stay within bounds
-    2. Collision violations → create time gaps by adjusting speeds
-    3. Reaching violations → ensure sufficient forward acceleration
-    """
-    from metaheuristic_intersection import feasibility_check
-
+def repair_solution(x_infeasible: np.ndarray, x0, v0, t0, params,
+                    max_repairs: int = 20) -> np.ndarray:
     x_repaired = x_infeasible.copy()
     N, K = params.N, params.K
+    dt = params.dt
+    eps = 1e-6
 
-    # Extract components
-    u_profiles = x_repaired[:N*K].reshape(N, K)
+    # Extract u & Z safely
+    u_flat = x_repaired[:N*K]
+    u_profiles = u_flat.reshape(N, K)
     Z_binary = x_repaired[N*K:] if len(x_repaired) > N*K else np.array([])
 
-    # Count violation types
-    has_velocity_viol = False
-    has_collision_viol = False
-    has_reaching_viol = False
-
-    # Parse violations
-    for constraint_type, result in violations.items():
-        if not result.get('satisfied', True):
-            if 'velocity' in constraint_type.lower():
-                has_velocity_viol = True
-            elif 'collision' in constraint_type.lower() or 'lateral' in constraint_type.lower():
-                has_collision_viol = True
-            elif 'reaching' in constraint_type.lower():
-                has_reaching_viol = True
-
-    # REPAIR STRATEGY 1: Fix velocity violations by smoothing
-    if has_velocity_viol:
-        for i in range(N):
-            # Apply moving average filter to smooth accelerations
-            window = 5
-            u_smooth = np.convolve(u_profiles[i], np.ones(window)/window, mode='same')
-            u_profiles[i] = u_smooth * 0.7  # Scale down to stay in bounds
-            u_profiles[i] = np.clip(u_profiles[i], params.u_min, params.u_max)
-
-    # REPAIR STRATEGY 2: Fix collisions by creating time separation
-    if has_collision_viol:
-        # Slow down some vehicles, speed up others to create gaps
-        for i in range(N):
-            if i % 2 == 0:
-                # Even vehicles: slow down in merge zone
-                merge_start_idx = int((params.L - params.S) / (v0[i] * params.dt))
-                merge_start_idx = max(0, min(merge_start_idx, K-10))
-                u_profiles[i, merge_start_idx:merge_start_idx+10] *= 0.5
-            else:
-                # Odd vehicles: speed up before merge zone
-                pre_merge_idx = max(0, int((params.L - params.S - 20) / (v0[i] * params.dt)))
-                pre_merge_idx = min(pre_merge_idx, K-10)
-                u_profiles[i, pre_merge_idx:pre_merge_idx+5] *= 1.3
-
-        # Clip to bounds
+    for attempt in range(max_repairs):
+        # Stage A: smooth + scale + clip within physical accel bounds
+        u_profiles = 0.5*u_profiles + 0.5*np.clip(u_profiles, params.u_min, params.u_max)
         u_profiles = np.clip(u_profiles, params.u_min, params.u_max)
 
-        # Also flip priorities to change crossing order
-        if len(Z_binary) > 0:
-            flip_idx = np.random.randint(0, len(Z_binary))
-            Z_binary[flip_idx] = 1.0 - Z_binary[flip_idx]
-
-    # REPAIR STRATEGY 3: Fix reaching violations by boosting forward motion
-    if has_reaching_viol:
+        # Stage B: gentle braking before merge — use robust indices
         for i in range(N):
-            # Increase all accelerations to ensure reaching goal
-            u_profiles[i] *= 1.5
-            u_profiles[i] = np.clip(u_profiles[i], 0.0, params.u_max)  # Only positive
+            v_start = max(float(v0[i]), eps)
+            # time-to-merge (approx) using approach distance (L-S)
+            t_pre = (params.L - params.S) / v_start
+            k_pre = int(np.clip(round(t_pre / dt), 0, K-1))
+            # apply a slight decel taper
+            u_profiles[i, :k_pre] = np.clip(u_profiles[i, :k_pre] - 0.1*abs(params.u_min),
+                                            params.u_min, params.u_max)
 
-    # Reconstruct solution
-    if len(Z_binary) > 0:
-        x_repaired = np.concatenate([u_profiles.flatten(), Z_binary])
-    else:
-        x_repaired = u_profiles.flatten()
+        # Stage C: conservative around the merge window
+        for i in range(N):
+            v_start = max(float(v0[i]), eps)
+            t_pre = (params.L - params.S) / v_start
+            t_mer = params.S / max(v_start, eps)
+            k0 = int(np.clip(round(t_pre / dt), 0, K-1))
+            k1 = int(np.clip(round((t_pre + t_mer) / dt), 0, K-1))
+            u_profiles[i, k0:k1+1] = np.clip(u_profiles[i, k0:k1+1],
+                                             params.u_min, params.u_max)  # keep braking allowed
 
-    # Verify repair worked (at least partially)
-    is_feas_after, _ = feasibility_check(x_repaired, x0, v0, t0, params)
-
-    if not is_feas_after:
-        # If still infeasible, try more aggressive repair
-        # Strategy: blend with known-good conservative solution
-        u_conservative = np.ones((N, K)) * 0.3  # Very gentle acceleration
-        u_conservative = np.clip(u_conservative, params.u_min, params.u_max)
-
-        # Blend 70% conservative, 30% current
-        u_blended = 0.7 * u_conservative + 0.3 * u_profiles
-        u_blended = np.clip(u_blended, params.u_min, params.u_max)
-
+        # Reassemble candidate
         if len(Z_binary) > 0:
-            x_repaired = np.concatenate([u_blended.flatten(), Z_binary])
+            x_repaired = np.concatenate([u_profiles.flatten(), Z_binary])
         else:
-            x_repaired = u_blended.flatten()
+            x_repaired = u_profiles.flatten()
+
+        # Quick feasibility check
+        is_feas, _ = feasibility_check(x_repaired, x0, v0, t0, params)
+        if is_feas:
+            return x_repaired
 
     return x_repaired
 
 
-def generate_initial_feasible_solution(params, x0, v0, t0, max_attempts=1000):
+
+def generate_initial_feasible_solution(params, x0, v0, t0, max_attempts=500):
     """
-    Generate initial FEASIBLE solution using conservative heuristic
-
-    Strategy: Start with gentle accelerations (more likely feasible)
+    Try main.generate_random_solution as a starter; if infeasible, attempt repairs;
+    fall back to a conservative zero-accel + zero-priority vector sized by conflict matrix.
     """
-    from metaheuristic_intersection import feasibility_check
-
-    for attempt in range(max_attempts):
-        # Generate solution with bias toward gentle accelerations
-        u_profiles = np.random.normal(0, 0.5, (params.N, params.K))
-        u_profiles = np.clip(u_profiles, params.u_min, params.u_max)
-
-        # Random priority variables
-        n_binary = 4  # Z_02, Z_03, Z_12, Z_13
-        Z_binary = np.random.randint(0, 2, n_binary).astype(float)
-
-        # Combine
-        x = np.concatenate([u_profiles.flatten(), Z_binary])
-
-        # Check feasibility
+    # Try several random candidates from the main generator (correct shape & Z length)
+    for _ in range(max_attempts):
+        x = generate_random_solution(params)
         is_feas, _ = feasibility_check(x, x0, v0, t0, params)
         if is_feas:
-            print(f"✅ Found initial feasible solution on attempt {attempt + 1}")
             return x
 
-    # If failed, return VERY conservative solution
-    print("⚠️  Using ultra-conservative fallback initial solution")
+        x_rep = repair_solution(x, x0, v0, t0, params, max_repairs=20)
+        is_feas, _ = feasibility_check(x_rep, x0, v0, t0, params)
+        if is_feas:
+            return x_rep
 
-    # Strategy: Very gentle constant acceleration to slowly reach goal
-    # Each vehicle accelerates gently, no conflicts
-    u_conservative = np.zeros((params.N, params.K))
+    # Fallback: conservative profile (u=0, all priorities 0)
+    N, K = params.N, params.K
+    u_conservative = np.zeros((N, K), dtype=float)
 
-    for i in range(params.N):
-        # Gentle acceleration for first 20 steps to reach decent speed
-        u_conservative[i, :20] = 0.5  # Gentle accel
-        # Then coast (zero acceleration)
-        u_conservative[i, 20:] = 0.0
+    # Size Z by conflict matrix (half of symmetric sum)
+    n_conflicts = int(np.sum(params.get_conflict_matrix()) // 2)
+    Z_conservative = np.zeros(n_conflicts, dtype=float)
 
-    u_conservative = np.clip(u_conservative, params.u_min, params.u_max)
+    return np.concatenate([u_conservative.flatten(), Z_conservative])
 
-    # Sequential priorities (vehicles go one by one)
-    Z_conservative = np.array([1.0, 1.0, 0.0, 0.0])
-
-    x_conservative = np.concatenate([u_conservative.flatten(), Z_conservative])
-
-    # VERIFY this is actually feasible
-    from metaheuristic_intersection import feasibility_check
-    is_feas, viols = feasibility_check(x_conservative, x0, v0, t0, params)
-
-    if is_feas:
-        print("✅ Conservative solution is feasible")
-    else:
-        print("❌ WARNING: Even conservative solution is infeasible!")
-        violated_constraints = [k for k, v in viols.items() if not v['satisfied']]
-        print(f"   Violations: {violated_constraints}")
-
-    return x_conservative
 
 
 # ============================================================================
@@ -190,37 +135,26 @@ def generate_initial_feasible_solution(params, x0, v0, t0, max_attempts=1000):
 
 def generate_neighbor(x_current, params, T, T_init):
     """
-    Generate neighbor solution with adaptive step size
-
-    Strategy:
-    - Perturb ~10% of continuous variables
-    - Step size decreases with temperature
-    - Flip binary variables with 30% probability
+    Continuous part: Gaussian perturb scaled by sqrt(T/T_init), clipped to [u_min, u_max]
+    Binary part: with 30% prob., flip a single priority bit.
     """
-    x_neighbor = x_current.copy()
     N, K = params.N, params.K
+    x_neighbor = x_current.copy()
 
-    # Adaptive step size
-    step_scale = np.sqrt(T / T_init)
-    u_step = 1.0 * step_scale
+    # Continuous u
+    step = 0.2 * np.sqrt(max(T, 1e-12) / max(T_init, 1e-12))
+    u = x_neighbor[:N*K].reshape(N, K)
+    u = np.clip(u + np.random.normal(0.0, step, size=(N, K)), params.u_min, params.u_max)
+    x_neighbor[:N*K] = u.flatten()
 
-    # Perturb random 10% of acceleration values
-    n_perturb = max(1, int(N * K * 0.1))
-    perturb_indices = np.random.choice(N * K, n_perturb, replace=False)
-
-    for idx in perturb_indices:
-        delta = np.random.uniform(-u_step, u_step)
-        x_neighbor[idx] += delta
-        x_neighbor[idx] = np.clip(x_neighbor[idx], params.u_min, params.u_max)
-
-    # Flip binary variables with 30% chance
-    n_binary = len(x_current) - N * K
+    # Binary Z
+    n_binary = len(x_neighbor) - N*K
     if n_binary > 0 and np.random.random() < 0.3:
-        flip_idx = np.random.randint(0, n_binary)
-        binary_idx = N * K + flip_idx
-        x_neighbor[binary_idx] = 1.0 - x_neighbor[binary_idx]
+        idx = N*K + np.random.randint(0, n_binary)
+        x_neighbor[idx] = 1.0 - x_neighbor[idx]
 
     return x_neighbor
+
 
 
 # ============================================================================
@@ -232,125 +166,133 @@ def simulated_annealing(params, x0, v0, t0,
                        T_final=0.01,
                        max_iter=5000):
     """
-    Simulated Annealing with guaranteed feasible solutions.
-    - Linear cooling
-    - Feasible repair mechanism
-    - Safe convergence logging
+    Simulated Annealing (linear cooling) with feasibility-first candidates.
+    This is your original flow, with clear debug prints added.
     """
     import numpy as np
     from metaheuristic_intersection import objective_function, feasibility_check
 
+    # --- helpers this file already defines ---
+    # - generate_initial_feasible_solution(params, x0, v0, t0)
+    # - repair_solution(x, x0, v0, t0, params, max_repairs=...)
+    # - generate_neighbor(x, params, T, T_init)
 
     # Linear cooling step
     beta = (T_init - T_final) / max_iter
+    T = float(T_init)
 
-    print("\n" + "="*80)
-    print("SIMULATED ANNEALING - GUARANTEED FEASIBLE VERSION")
-    print("="*80)
-    print("Generating initial feasible solution...")
-
-    # 1️⃣ Initial feasible solution
+    # Initial solution (feasible)
     x_current = generate_initial_feasible_solution(params, x0, v0, t0)
-    f_current, f_time_current, f_energy_current, _ = objective_function(
-        x_current, x0, v0, t0, params
-    )
+
+    is_feas_init, _ = feasibility_check(x_current, x0, v0, t0, params)
+    if not is_feas_init:
+        x_current = repair_solution(x_current, x0, v0, t0, params, max_repairs=10)
+        is_feas_init, _ = feasibility_check(x_current, x0, v0, t0, params)
+
+    f_time, f_energy, f_current, info_current = objective_function(x_current, x0, v0, t0, params)
 
     x_best = x_current.copy()
-    f_best = f_current
+    f_best = float(f_current)
 
-    # 2️⃣ Counters and logs
+    # Debug counters / history
     n_accepted = 0
-    n_repaired = 0
-    T = T_init
+    n_feasible = 1  # initial is feasible by construction
+    n_skipped  = 0
+    rng = np.random.default_rng()
 
     history = {
         'iteration': [],
         'f_best': [],
         'f_current': [],
         'T': [],
-        'acceptance_rate': [],
-        'repairs_per_iter': []
+        'accept_rate': [],
+        'feas_rate': [],
+        'skipped': []
     }
 
-    print(f"\n✅ Initial feasible solution found")
-    print(f"   Fitness: {f_current:.2f} (time={f_time_current:.2f}, energy={f_energy_current:.2f})")
-    print(f"   Cooling: linear (β = {beta:.6f})\n")
+    # --- header prints ---
+    nZ = len(x_current) - params.N * params.K
+    print("="*80)
+    print("[SA] schedule=linear"
+          f"  T0={T_init}  Tf={T_final}  max_iter={max_iter}")
+    print(f"[SA] dims: N={params.N}  K={params.K}  |Z|={nZ}")
+    print(f"[SA] init: f={f_current:.6g}  (time={f_time:.6g}, energy={f_energy:.6g})  feasible=✅", flush=True)
 
-    # 3️⃣ MAIN LOOP
-    for iteration in range(max_iter):
-        # Generate neighbor
+    # --- main loop ---
+    PRINT_EVERY = 50  # adjust if you want fewer/more logs
+
+    for it in range(max_iter):
+        # Cool
+        T = max(T_final, T_init - beta * (it + 1))
+
+        # Propose neighbor and try a quick repair
         x_neighbor = generate_neighbor(x_current, params, T, T_init)
+        x_neighbor = repair_solution(x_neighbor, x0, v0, t0, params, max_repairs=4)
 
-        # Enforce feasibility with limited repairs
-        repairs_this_iter = 0
-        is_feas, violations = feasibility_check(x_neighbor, x0, v0, t0, params)
-        repair_attempts = 0
-
-        while not is_feas and repair_attempts < 20:
-            x_neighbor = repair_solution(x_neighbor, violations, params, x0, v0, t0)
-            n_repaired += 1
-            repairs_this_iter += 1
-            repair_attempts += 1
-            is_feas, violations = feasibility_check(x_neighbor, x0, v0, t0, params)
-
-        # If still infeasible after 20 repairs, skip this neighbor
+        # Feasibility first
+        is_feas, _ = feasibility_check(x_neighbor, x0, v0, t0, params)
         if not is_feas:
+            n_skipped += 1
+            # periodic progress print
+            if (it % PRINT_EVERY) == 0 or it == max_iter - 1:
+                acc_rate = n_accepted / (it + 1)
+                feas_rate = n_feasible / (it + 1)
+                print(f"[SA][it={it}] T={T:.4g}  f_cur={f_current:.6g}  f_best={f_best:.6g}  "
+                      f"accept_rate={acc_rate:.2%}  feas_rate={feas_rate:.2%}  skipped={n_skipped}", flush=True)
             continue
 
-        # Evaluate
-        f_neighbor, f_time_neighbor, f_energy_neighbor, _ = objective_function(
-            x_neighbor, x0, v0, t0, params
-        )
+        n_feasible += 1
+
+        # Score feasible neighbor
+        f_time_n, f_energy_n, f_neighbor, info_neighbor = objective_function(x_neighbor, x0, v0, t0, params)
+        dF = f_neighbor - f_current
 
         # Metropolis acceptance
-        delta_f = f_neighbor - f_current
-        if delta_f < 0:
-            accept = True
+        accepted = False
+        if dF <= 0:
+            accepted = True
         else:
-            prob_accept = np.exp(-delta_f / max(T, 1e-6))
-            accept = np.random.random() < prob_accept
+            p = np.exp(-dF / max(T, 1e-12))
+            if rng.random() < p:
+                accepted = True
 
-        if accept:
-            x_current = x_neighbor.copy()
-            f_current = f_neighbor
+        if accepted:
+            x_current = x_neighbor
+            f_current = float(f_neighbor)
+            info_current = info_neighbor
             n_accepted += 1
 
-        # Update best
-        if f_neighbor < f_best:
-            x_best = x_neighbor.copy()
-            f_best = f_neighbor
+        # New best?
+        if f_current < f_best:
+            print(f"[SA][it={it}] new best: {f_best:.6g} → {f_current:.6g}", flush=True)
+            x_best = x_current.copy()
+            f_best = float(f_current)
 
-        # Update temperature (linear schedule)
-        T = max(T_init - beta * (iteration + 1), T_final)
-
-        # Log
-        history['iteration'].append(iteration)
+        # Book-keeping + periodic print
+        history['iteration'].append(it)
         history['f_best'].append(f_best)
         history['f_current'].append(f_current)
         history['T'].append(T)
-        history['acceptance_rate'].append(n_accepted / (iteration + 1))
-        history['repairs_per_iter'].append(repairs_this_iter)
+        history['accept_rate'].append(n_accepted / (it + 1))
+        history['feas_rate'].append(n_feasible / (it + 1))
+        history['skipped'].append(n_skipped)
 
-        # Progress print
-        if iteration % 10 == 0 or iteration == max_iter - 1:
-            print(f"Iter {iteration:4d}: f_best={f_best:7.2f}, "
-                  f"f_current={f_current:7.2f}, T={T:7.3f}, "
-                  f"accept={n_accepted/(iteration+1):5.1%}, "
-                  f"repairs/iter={repairs_this_iter}")
+        if (it % PRINT_EVERY) == 0 or it == max_iter - 1:
+            print(f"[SA][it={it}] T={T:.4g}  f_cur={f_current:.6g}  f_best={f_best:.6g}  "
+                  f"accept_rate={history['accept_rate'][-1]:.2%}  "
+                  f"feas_rate={history['feas_rate'][-1]:.2%}  skipped={n_skipped}", flush=True)
 
-    # 4️⃣ Final feasibility check
+    # --- summary ---
     is_feas_final, _ = feasibility_check(x_best, x0, v0, t0, params)
-
-    print("\n" + "="*80)
-    print("SIMULATED ANNEALING COMPLETE")
     print("="*80)
     print(f"Best fitness:           {f_best:.2f}")
     print(f"Final feasibility:      {'✅ FEASIBLE' if is_feas_final else '❌ INFEASIBLE'}")
     print(f"Acceptance rate:        {n_accepted / max(1, len(history['iteration'])):.2%}")
-    print(f"Avg repairs per iter:   {n_repaired / max(1, len(history['iteration'])):.2f}")
+    print(f"Avg skipped/iter:       {n_skipped / max(1, len(history['iteration'])):.2f}")
     print("="*80 + "\n")
 
     return x_best, f_best, history
+
 
 
 # ============================================================================
@@ -372,6 +314,10 @@ def plot_convergence(history):
     """
     iters = history['iteration']
 
+    # Normalize keys so this works with both SA variants
+    acc = history.get('acceptance_rate', history.get('accept_rate', []))
+    feas = history.get('feasible_rate', history.get('feas_rate', []))
+    
     fig, axs = plt.subplots(2, 2, figsize=(12, 8))
     fig.suptitle("Simulated Annealing Convergence", fontsize=14, fontweight='bold')
 
@@ -395,7 +341,7 @@ def plot_convergence(history):
 
     # === 3️⃣ Acceptance Rate ===
     ax = axs[1, 0]
-    ax.plot(iters, [a * 100 for a in history['acceptance_rate']], 'g-', linewidth=2)
+    ax.plot(iters, [a * 100 for a in acc], 'g-', linewidth=2)    
     ax.set_xlabel("Iteration")
     ax.set_ylabel("Acceptance Rate (%)")
     ax.set_title("Acceptance Rate Over Time")
@@ -404,10 +350,10 @@ def plot_convergence(history):
     # === 4️⃣ Repairs per Iteration ===
     ax = axs[1, 1]
     if 'repairs_per_iter' in history:
-        ax.plot(iters, history['repairs_per_iter'], 'purple', linewidth=2, label='Repairs per Iteration')
+        ax.plot(iters, history['repairs_per_iter'], 'purple', linewidth=2)
         ax.set_ylabel("Repairs per Iteration")
-    elif 'repair_rate' in history:  # backward compatibility
-        ax.plot(iters, [r * 100 for r in history['repair_rate']], 'purple', linewidth=2, label='Repair (%)')
+    elif 'repair_rate' in history:
+        ax.plot(iters, [r * 100 for r in history['repair_rate']], 'purple', linewidth=2)
         ax.set_ylabel("Repair Rate (%)")
     else:
         ax.text(0.5, 0.5, "No repair data", ha='center', va='center', fontsize=12, color='gray')
@@ -427,50 +373,21 @@ def plot_convergence(history):
 # ============================================================================
 
 def random_search_baseline(params, x0, v0, t0, n_samples=500):
-    """Random search baseline - now uses pure objective"""
-    from metaheuristic_intersection import objective_function, feasibility_check
+    rng = np.random.default_rng()
+    best = (np.inf, None, None)
+    feas_count = 0
 
-    print("\n" + "="*80)
-    print("RANDOM SEARCH BASELINE")
-    print("="*80)
-
-    best_f = float('inf')
-    best_x = None
-    best_feasible = False
-    n_feasible = 0
-
-    for i in range(n_samples):
+    for _ in range(n_samples):
         x = generate_random_solution(params)
+        x = repair_solution(x, x0, v0, t0, params, max_repairs=2)
+        f, is_feas, info = evaluate_solution(x, x0, v0, t0, params)
+        feas_count += int(is_feas)
+        if f < best[0]:
+            best = (f, x, info)
 
-        # Check feasibility first
-        is_feas, _ = feasibility_check(x, x0, v0, t0, params)
+    print(f"Random search feasible rate: {feas_count}/{n_samples} = {feas_count/n_samples:.2%}")
+    return best
 
-        if is_feas:
-            n_feasible += 1
-            # Only evaluate objective if feasible
-            f, _, _, _ = objective_function(x, x0, v0, t0, params)
-
-            # Update best
-            if not best_feasible or f < best_f:
-                best_x = x.copy()
-                best_f = f
-                best_feasible = True
-
-        if (i+1) % 100 == 0:
-            status = f"feasible_rate={n_feasible/(i+1):.2%}"
-            if best_feasible:
-                status += f", best_f={best_f:.2f}"
-            print(f"Sample {i+1}/{n_samples}: {status}")
-
-    print(f"\nRandom search complete:")
-    if best_feasible:
-        print(f"  Best fitness: {best_f:.2f} ✅")
-    else:
-        print(f"  No feasible solution found ❌")
-    print(f"  Feasibility rate: {n_feasible/n_samples:.2%}")
-    print("="*80 + "\n")
-
-    return best_x, best_f, best_feasible
 
 
 # ============================================================================
@@ -518,9 +435,10 @@ def plot_live_sa_dashboard(history, params, x_current, x_best, x0, v0, t0,
     ax1.grid(True, alpha=0.3)
 
     # Annotate current point
-    ax1.plot(iteration, info_current['fitness'], 'ro', markersize=10, zorder=10)
-    ax1.annotate(f"Current: {info_current['fitness']:.1f}",
-                xy=(iteration, info_current['fitness']),
+    cur_val = history['f_current'][-1]
+    ax1.plot(iteration, cur_val, 'ro', markersize=10, zorder=10)
+    ax1.annotate(f"Current: {cur_val:.1f}",
+                xy=(iteration, cur_val),
                 xytext=(10, 10), textcoords='offset points',
                 bbox=dict(boxstyle='round', facecolor='yellow', alpha=0.8),
                 fontsize=9)
@@ -532,7 +450,8 @@ def plot_live_sa_dashboard(history, params, x_current, x_best, x0, v0, t0,
 
     N, K, dt = params.N, params.K, params.dt
     u_current = x_current[:N*K].reshape(N, K)
-    colors = ['blue', 'cyan', 'red', 'orange']
+    cmap = plt.get_cmap('tab20')
+    colors = [cmap(i % 20) for i in range(params.N)]
 
     for i in range(N):
         x_traj, v_traj = simulate_vehicle_trajectory(u_current[i], x0[i], v0[i], dt, K)
@@ -683,7 +602,7 @@ def simulated_annealing_with_live_viz(params, x0, v0, t0,
     """
     # Initialize
     x_current = generate_random_solution(params)
-    f_current, is_feas_current, info_current = penalized_objective(
+    f_current, is_feas_current, info_current = evaluate_solution(
         x_current, x0, v0, t0, params
     )
 
@@ -708,7 +627,7 @@ def simulated_annealing_with_live_viz(params, x0, v0, t0,
     print("\n" + "="*80)
     print("LIVE SIMULATED ANNEALING VISUALIZATION")
     print("="*80)
-    print("Dashboard will update every 100 iterations...")
+    print(f"Dashboard will update every {update_interval} iterations...")
     print("Close the figure window to continue to next update.")
     print("="*80 + "\n")
 
@@ -716,7 +635,7 @@ def simulated_annealing_with_live_viz(params, x0, v0, t0,
     for iteration in range(max_iter):
         # Generate and evaluate neighbor
         x_neighbor = generate_neighbor(x_current, params, T, T_init)
-        f_neighbor, is_feas_neighbor, info_neighbor = penalized_objective(
+        f_neighbor, is_feas_neighbor, info_neighbor = evaluate_solution(
             x_neighbor, x0, v0, t0, params
         )
 
@@ -808,7 +727,6 @@ def parametric_study_cooling_rate(params, x0, v0, t0):
             params, x0, v0, t0,
             T_init=1000.0,
             T_final=1.0,
-            cooling=alpha,
             max_iter=5000,
         )
 
@@ -887,7 +805,6 @@ def parametric_study_temperature(params, x0, v0, t0):
             params, x0, v0, t0,
             T_init=float(T),
             T_final=1.0,
-            cooling=0.95,
             max_iter=5000,
         )
 
@@ -944,7 +861,7 @@ def statistical_validation(params, x0, v0, t0, n_runs=10):
         )
 
         # Evaluate final solution
-        _, is_feas, info = penalized_objective(x_best, x0, v0, t0, params)
+        _, is_feas, info = evaluate_solution(x_best, x0, v0, t0, params)
 
         results.append({
             'run_id': run + 1,
@@ -1040,7 +957,7 @@ def run_comprehensive_m3_demo():
     print("="*80)
 
     # Setup
-    params = ProblemParameters()
+    params = make_params()
     x0 = np.zeros(4)
     v0 = np.array([12.0, 11.0, 13.0, 10.0])
     t0 = np.array([0.0, 0.5, 1.0, 1.5])
@@ -1049,9 +966,8 @@ def run_comprehensive_m3_demo():
     print("\n" + "="*80)
     print("PART 1: Random Search Baseline")
     print("="*80)
-    x_random, f_random, feas_random = random_search_baseline(
-        params, x0, v0, t0, n_samples=500
-    )
+    f_random, x_random, info_random = random_search_baseline(params, x0, v0, t0, n_samples=500)
+
 
     # Part 2: SA with live visualization
     print("\n" + "="*80)
@@ -1128,10 +1044,10 @@ if __name__ == "__main__":
         run_comprehensive_m3_demo()
     else:
         # Quick single run
-        params = ProblemParameters()
-        x0 = np.zeros(4)
-        v0 = np.array([12.0, 11.0, 13.0, 10.0])
-        t0 = np.array([0.0, 0.5, 1.0, 1.5])
+        params = make_params()
+        x0 = np.zeros(params.N, dtype=float)
+        v0 = build_v0_random(params)
+        t0 = build_spawn_times(params)
 
         # --- Simulated Annealing only ---
         x_best, f_best, history = simulated_annealing(

@@ -155,11 +155,11 @@ class ProblemParameters:
 def make_params():
     return ProblemParameters(
         # Vehicles (total must equal the sum below)
-        N=12,
-        N_EW=3,
-        N_WE=3,
-        N_NS=3,
-        N_SN=3,
+        N=8,
+        N_EW=2,
+        N_WE=2,
+        N_NS=2,
+        N_SN=2,
 
         # Time discretization
         dt=0.5,
@@ -878,26 +878,33 @@ def check_constraint_7_lateral_collision(trajectories: List,
 
                 # Entry time to merging zone (x >= L - S)
                 idx_i = np.where(x_i >= (params.L - params.S))[0]
-                t_m_i = t0[i] + (idx_i[0] * params.dt if len(idx_i) > 0 else np.inf)
+                t_m_i = t0[i] + (idx_i[0] * params.dt if idx_i.size > 0 else np.inf)
 
                 idx_j = np.where(x_j >= (params.L - params.S))[0]
-                t_m_j = t0[j] + (idx_j[0] * params.dt if len(idx_j) > 0 else np.inf)
+                t_m_j = t0[j] + (idx_j[0] * params.dt if idx_j.size > 0 else np.inf)
 
                 # Exit time from merging zone (x >= L)
                 idx_exit_i = np.where(x_i >= params.L)[0]
-                t_f_i = t0[i] + (idx_exit_i[0] * params.dt if len(idx_exit_i) > 0 else np.inf)
+                t_f_i = t0[i] + (idx_exit_i[0] * params.dt if idx_exit_i.size > 0 else np.inf)
 
                 idx_exit_j = np.where(x_j >= params.L)[0]
-                t_f_j = t0[j] + (idx_exit_j[0] * params.dt if len(idx_exit_j) > 0 else np.inf)
+                t_f_j = t0[j] + (idx_exit_j[0] * params.dt if idx_exit_j.size > 0 else np.inf)
 
                 # Safety time buffer
                 crossing_time = params.dt_safe
 
+                # Before computing the priority condition
+                required = False          # <- default so it's always defined
+                gap = np.nan              # <- avoid inf - inf warnings; for reporting only
+
                 # Check priority constraint based on ROUNDED Z value
                 if z_ij >= 0.5:
                     # Vehicle i has priority (should exit before j enters)
-                    required = t_f_i + crossing_time <= t_f_j + crossing_time/2
-                    gap = t_f_j + crossing_time/2 - (t_f_i + crossing_time)
+                    if np.isfinite(t_f_i) and np.isfinite(t_f_j):
+                        gap = t_f_j + crossing_time/2 - (t_f_i + crossing_time)   # (or the symmetric form)
+                    else:
+                        gap = np.nan  # don't trigger ∞ - ∞; record NaN for reporting only
+
 
                     if not required:
                         violations.append({
@@ -914,8 +921,10 @@ def check_constraint_7_lateral_collision(trajectories: List,
                         })
                 else:
                     # Vehicle j has priority (z_ij = 0, meaning z_ji = 1)
-                    required = t_f_j + crossing_time <= t_f_i + crossing_time/2
-                    gap = t_f_i + crossing_time/2 - (t_f_j + crossing_time)
+                    if np.isfinite(t_f_i) and np.isfinite(t_f_j):
+                        gap = t_f_i + crossing_time/2 - (t_f_j + crossing_time)   # (or the symmetric form)
+                    else:
+                        gap = np.nan  # don't trigger ∞ - ∞; record NaN for reporting only
 
                     if not required:
                         violations.append({

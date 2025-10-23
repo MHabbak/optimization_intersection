@@ -13,42 +13,41 @@ class ProblemParameters:
     Parameters for CAV intersection optimization
     """
     # Number of vehicles
-    N: int = 4                  # Total vehicles
-    N_EW: int = 1              # East to West
-    N_WE: int = 1              # West to East
-    N_NS: int = 1              # North to South
-    N_SN: int = 1              # South to North
+    N: int                    # Total vehicles
+    N_EW: int                 # East to West
+    N_WE: int                 # West to East
+    N_NS: int                 # North to South
+    N_SN: int                 # South to North
 
-    # Time discretization - EXTENDED to remove artificial time constraint
-    dt: float = 0.5            # Time step (seconds) - [0.1-0.5 typical]
-    K: int = 200               # Maximum time steps (safety limit)
-    T_max: float = 100.0        # Maximum time horizon (seconds, safety limit)
+    # Time discretization
+    dt: float                 # Time step (seconds)
+    K: int                    # Maximum time steps (safety limit)
+    T_max: float              # Maximum time horizon (seconds, safety limit)
 
-    # NOTE: T_max is now an upper bound for simulation, not a hard constraint.
-    # The objective function measures actual crossing time, which can be much less.
-    # Time minimization in objective naturally pushes for fast crossings (~10-20s).
-    # Extended horizon ensures solution space completeness without artificial limits.
-
-    # Acceleration limits (m/s²)
-    u_min: float = -4.0        # Max deceleration (AASHTO standard)
-    u_max: float = 3.0         # Max acceleration (typical vehicle)
+    # Acceleration limits (m/s^2)
+    u_min: float              # Max deceleration
+    u_max: float              # Max acceleration
 
     # Velocity limits (m/s)
-    v_min: float = 1.0         # Min velocity in intersection (no stopping)
-    v_max: float = 20.0        # Max velocity
-    v_min_approach: float = 0.0  # Min velocity before intersection
+    v_min: float              # Min velocity in intersection
+    v_max: float              # Max velocity
+    v_min_approach: float     # Min velocity before intersection
+
+    t0_min: float   # minimum inter-vehicle time gap within a lane
+    t0_max: float   # maximum inter-vehicle time gap within a lane
 
     # Intersection geometry (meters)
-    L: float = 150.0           # Control zone length (approach distance)
-    S: float = 12.0            # Merging/conflict zone size
-    delta: float = 5.0         # Minimum separation distance (point mass)
+    L: float                  # Control zone length (approach distance)
+    S: float                  # Merging/conflict zone size
+    delta: float              # Minimum separation distance (point mass)
 
     # Safety parameters
-    dt_safe: float = 2.0       # Minimum time separation (seconds)
-    M: float = 1000.0           # Big-M constant for MILP formulation
+    dt_safe: float            # Minimum time separation (seconds)
+    M: float                  # Big-M constant for MILP
 
     # Objective function weights
-    weights = [1,3]       
+    weights: List[float]
+      
 
     def __post_init__(self):
         """Validate parameters after initialization"""
@@ -148,6 +147,105 @@ class ProblemParameters:
         return dir_i == dir_j
 
 # ============================================================================
+# ============================================================================
+# USER METAHEURISTICS CONFIG — EDIT THIS BLOCK ONLY
+# ============================================================================
+# All problem-wide parameters live here. Change N or any constraint here and
+# the rest of the code uses it via the `params` object.
+def make_params():
+    return ProblemParameters(
+        # Vehicles (total must equal the sum below)
+        N=12,
+        N_EW=3,
+        N_WE=3,
+        N_NS=3,
+        N_SN=3,
+
+        # Time discretization
+        dt=0.5,
+        K=200,
+        T_max=100.0,
+
+        # Acceleration limits (m/s^2)
+        u_min=-4.0,
+        u_max=3.0,
+
+        # Velocity limits (m/s)
+        v_min=1.0,
+        v_max=20.0,
+        v_min_approach=0.0,
+
+        # Intersection geometry (m)
+        L=150.0,
+        S=12.0,
+        delta=5.0,
+
+        # Safety
+        dt_safe=2.0,
+        M=1000.0,
+
+        # Objective weights [time, energy]
+        weights=[2.0, 3.0],
+
+        t0_min=3.0,
+        t0_max=6.0,
+    )
+
+# Instantiate a single, canonical parameters object used by examples/tests.
+# You can change values above and re-run without touching any other part.
+params = make_params()
+
+def build_spawn_times(params: ProblemParameters) -> np.ndarray:
+    """
+    First vehicle in each lane at t=0.
+    Each subsequent vehicle in the same lane gets an additional random gap U[t0_min, t0_max].
+    """
+    rng = np.random.default_rng()  # no seed → fresh randomness each run
+    lanes = [('EW', params.N_EW), ('WE', params.N_WE), ('NS', params.N_NS), ('SN', params.N_SN)]
+    t_list = []
+
+    for _, cnt in lanes:
+        if cnt <= 0:
+            continue
+        # First vehicle in the lane at t=0
+        times = [0.0]
+        if cnt > 1:
+            # Draw (cnt-1) random gaps ∈ [t0_min, t0_max], then accumulate
+            gaps = rng.uniform(params.t0_min, params.t0_max, size=cnt - 1)
+            times.extend(np.cumsum(gaps))
+        t_list.extend(times)
+
+    t0 = np.asarray(t_list, dtype=float)
+    assert len(t0) == params.N
+    return t0
+
+def build_v0_random(params: ProblemParameters) -> np.ndarray:
+    """
+    Random initial speeds uniformly within allowed approach bounds.
+    """
+    rng = np.random.default_rng()  # no seed
+    lo = max(params.v_min_approach, 0.0)
+    hi = params.v_max
+    v0 = rng.uniform(lo, hi, size=params.N)  # draws in [lo, hi)
+    return v0
+
+# Helper: dynamic direction label strings used by plots/labels
+def pretty_dir(d):
+    return {"EW": "E->W", "WE": "W->E", "NS": "N->S", "SN": "S->N"}[d]
+
+# Helper: build per-vehicle directions list using params
+def all_vehicle_dirs(params):
+    return [params.get_vehicle_direction(i) for i in range(params.N)]
+
+# Helper: stable color palette for any N
+def color_for(i):
+    palette = [
+        "#1f77b4","#ff7f0e","#2ca02c","#d62728","#9467bd","#8c564b",
+        "#e377c2","#7f7f7f","#bcbd22","#17becf"
+    ]
+    return palette[i % len(palette)]
+# ============================================================================
+
 # VEHICLE DYNAMICS SIMULATION
 # ============================================================================
 
@@ -185,40 +283,53 @@ def simulate_vehicle_trajectory(u: np.ndarray, x0: float, v0: float,
     
     return x, v
 
-def simulate_until_completion(u_profile: np.ndarray,
-                              x0: float,
-                              v0: float,
-                              dt: float,
-                              L: float,
-                              K_max: int = 200) -> Tuple[np.ndarray, np.ndarray, int]:
+def in_merge_zone(x, params):
+    # merge is the last S meters of the lane *centered at the intersection*:
+    # [L - S, L]. Outside it (both before and after), use approach bounds.
+    return (x >= params.L - params.S) and (x <= params.L)
+
+def v_bounds_at(x, params):
+    vmin = params.v_min if in_merge_zone(x, params) else params.v_min_approach
+    return vmin, params.v_max
+
+def simulate_until_completion(u_profile, x0, v0, dt, params, K_max=None, x_exit=None):
     """
-    Simulate vehicle trajectory until it exits control zone OR reaches K_max
-
-    Returns:
-        x: Position trajectory (variable length)
-        v: Velocity trajectory (variable length)
-        k_actual: Actual number of steps used
+    Integrate forward until x >= x_exit (default 2L - S).
+    Enforce kinematics exactly by restricting u_k so that v_{k+1} stays within bounds.
     """
-    x = [x0]
-    v = [v0]
+    if K_max is None:
+        K_max = params.K
+    if x_exit is None:
+        x_exit = 2*params.L - params.S
 
-    for k in range(K_max):
-        # Get acceleration for this step (or 0 if beyond u_profile length)
-        u_k = u_profile[k] if k < len(u_profile) else 0.0
+    x = [float(x0)]
+    v = [float(v0)]
+    for k in range(min(K_max, len(u_profile))):
+        u_prop = float(u_profile[k])
 
-        # Update velocity and position
+        # dynamic admissible interval for u so v_{k+1} ∈ [vmin, vmax]
+        vmin, vmax = v_bounds_at(x[-1], params)
+        u_lo = max(params.u_min, (vmin - v[-1]) / dt)
+        u_hi = min(params.u_max, (vmax - v[-1]) / dt)
+        if u_lo > u_hi:
+            # no feasible control to keep next-velocity in bounds
+            return np.asarray(x), np.asarray(v), k  # caller can penalize
+
+        # filter control (feasible-by-construction), do NOT clamp state
+        u_k = u_prop
+        if u_k < u_lo: u_k = u_lo
+        if u_k > u_hi: u_k = u_hi
+
         v_next = v[-1] + u_k * dt
         x_next = x[-1] + v[-1] * dt + 0.5 * u_k * dt**2
 
         v.append(v_next)
         x.append(x_next)
 
-        # Check if vehicle exited control zone
-        if x_next >= L:
-            return np.array(x), np.array(v), k + 1
+        if x_next >= x_exit:
+            return np.asarray(x), np.asarray(v), k + 1
 
-    # Reached K_max without exiting
-    return np.array(x), np.array(v), K_max
+    return np.asarray(x), np.asarray(v), min(K_max, len(u_profile))
 
 # ============================================================================
 # OBJECTIVE FUNCTION
@@ -232,13 +343,14 @@ def objective_function(x_decision: np.ndarray,
     """
     Compute objective function with ADAPTIVE time horizon
 
-    Each vehicle simulates until it exits (x >= L), not fixed K steps.
+    Each vehicle simulates until it exits (x >= 2L-S), not fixed K steps.
     """
     N = params.N
     dt = params.dt
     w_t = params.weights[0]
     w_f = params.weights[1]
     L = params.L
+    x_exit = 2*params.L - params.S
 
     # Extract acceleration profiles (use first K values, will be adaptively truncated)
     K_nominal = params.K
@@ -250,7 +362,7 @@ def objective_function(x_decision: np.ndarray,
 
     for i in range(N):
         x_traj, v_traj, k_actual = simulate_until_completion(
-            u_profiles[i], x0[i], v0[i], dt, L, K_max=params.K
+            u_profiles[i], x0[i], v0[i], params.dt, params, K_max=params.K
         )
 
         trajectories.append((x_traj, v_traj))
@@ -260,14 +372,20 @@ def objective_function(x_decision: np.ndarray,
         completion_times.append(t_completion)
 
     # Check if all vehicles completed
-    all_completed = all(traj[0][-1] >= L for traj in trajectories)
+    all_completed = all(traj[0][-1] >= x_exit for traj in trajectories)
 
     if not all_completed:
         # Penalize incomplete trajectories heavily
+        energies = [
+            np.sum(u_profiles[i, :len(trajectories[i][0]) - 1] ** 2) * dt
+            for i in range(N)
+        ]
         return 1e6, 1e6, 0.0, {
             'all_completed': False,
             'trajectories': trajectories,
-            'completion_times': completion_times
+            'completion_times': completion_times,
+            'travel_times': np.array(completion_times) - t0, 
+            'energies': np.array(energies),
         }
 
     # Calculate time cost (sum of actual completion times)
@@ -414,10 +532,9 @@ def check_constraint_4_velocity_limits(trajectories: List, params: ProblemParame
     
     for i, (x_traj, v_traj) in enumerate(trajectories):
         # Find where vehicle enters merging zone (x >= L - S)
-        in_merge_zone = x_traj >= (params.L - params.S)
-        
+        in_merge_zone = (x_traj >= (params.L - params.S)) & (x_traj < params.L)        
         # Before merging zone
-        before_merge = ~in_merge_zone
+        before_merge = x_traj < (params.L - params.S)
         v_before = v_traj[before_merge]
         
         if len(v_before) > 0:
@@ -482,26 +599,26 @@ def check_constraint_5_reaching_zones(trajectories: List, params: ProblemParamet
 
     for i, (x_traj, v_traj) in enumerate(trajectories):
         # Check 1: Reaches merging zone
-        reaches_merge = np.any(x_traj >= (params.L))
+        reaches_merge = np.any(x_traj >= (params.L - params.S))
         if not reaches_merge:
             violations.append({
                 'vehicle': i,
                 'type': 'does_not_reach_merging_zone',
                 'max_position': np.max(x_traj),
-                'target': params.L,
-                'deficit': (params.L) - np.max(x_traj),
+                'target': params.L - params.S,  # <- fix target
+                'deficit': (params.L - params.S) - np.max(x_traj),
                 'note': f'Vehicle did not reach merge zone even with {params.T_max}s horizon'
             })
 
         # Check 2: Reaches exit
-        reaches_exit = np.any(x_traj >= params.L)
+        reaches_exit = np.any(x_traj >= (2*params.L - params.S))
         if not reaches_exit:
             violations.append({
                 'vehicle': i,
                 'type': 'does_not_reach_exit',
                 'max_position': np.max(x_traj),
-                'target': params.L,
-                'deficit': (params.L) - np.max(x_traj),
+                'target': 2*params.L - params.S,   # <- fix target
+                'deficit': (2*params.L - params.S) - np.max(x_traj),
                 'note': f'Vehicle did not complete crossing even with {params.T_max}s horizon'
             })
 
@@ -760,17 +877,17 @@ def check_constraint_7_lateral_collision(trajectories: List,
                 x_j, v_j = trajectories[j]
 
                 # Entry time to merging zone (x >= L - S)
-                idx_i = np.where(x_i >= params.L)[0]
+                idx_i = np.where(x_i >= (params.L - params.S))[0]
                 t_m_i = t0[i] + (idx_i[0] * params.dt if len(idx_i) > 0 else np.inf)
 
-                idx_j = np.where(x_j >= params.L)[0]
+                idx_j = np.where(x_j >= (params.L - params.S))[0]
                 t_m_j = t0[j] + (idx_j[0] * params.dt if len(idx_j) > 0 else np.inf)
 
                 # Exit time from merging zone (x >= L)
-                idx_exit_i = np.where(x_i >= params.L + params.S)[0]
+                idx_exit_i = np.where(x_i >= params.L)[0]
                 t_f_i = t0[i] + (idx_exit_i[0] * params.dt if len(idx_exit_i) > 0 else np.inf)
 
-                idx_exit_j = np.where(x_j >= params.L + params.S)[0]
+                idx_exit_j = np.where(x_j >= params.L)[0]
                 t_f_j = t0[j] + (idx_exit_j[0] * params.dt if len(idx_exit_j) > 0 else np.inf)
 
                 # Safety time buffer
@@ -846,7 +963,7 @@ def feasibility_check(x_decision: np.ndarray,
     trajectories = []
     for i in range(N):
         x_traj, v_traj, k_actual = simulate_until_completion(
-            u_profiles[i], x0[i], v0[i], dt, L, K_max=params.K
+            u_profiles[i], x0[i], v0[i], params.dt, params, K_max=params.K
         )
         trajectories.append((x_traj, v_traj))
     
@@ -1009,13 +1126,15 @@ def plot_combined_visualization(x_decision: np.ndarray, x0: np.ndarray,
 
     # Simulate all vehicles
     trajectories = []
-    max_time = 0
+    max_len = 0
     for i in range(N):
-        x_traj, v_traj = simulate_vehicle_trajectory(u_profiles[i], x0[i], v0[i], dt, K)
+        x_traj, v_traj, k_actual = simulate_until_completion(
+            u_profiles[i], x0[i], v0[i], dt, params, K_max=K
+        )
         t_traj = t0[i] + np.arange(len(x_traj)) * dt
         trajectories.append((t_traj, x_traj, v_traj))
-        max_time = max(max_time, t_traj[-1])
-
+        max_len = max(max_len, len(x_traj))
+   
     # Create figure with 3 subplots
     fig = plt.figure(figsize=(18, 10))
     fig.canvas.manager.set_window_title('Multi-Vehicle Intersection Simulation')
@@ -1066,19 +1185,15 @@ def plot_combined_visualization(x_decision: np.ndarray, x0: np.ndarray,
                               edgecolor='red', linewidth=3, linestyle='--', zorder=3)
     ax_intersection.add_patch(conflict_zone)
 
-    ax_intersection.text(0, conflict_size/2 + 2, 'DANGER', ha='center', va='bottom',
-                fontsize=10, fontweight='bold', color='red', zorder=10)
-
     ax_intersection.set_xlabel('East-West (m)', fontsize=11)
     ax_intersection.set_ylabel('North-South (m)', fontsize=11)
     ax_intersection.set_title('Live Intersection View', fontsize=12, fontweight='bold')
     ax_intersection.grid(True, alpha=0.3, linestyle=':', zorder=0)
 
     # Vehicle setup
-    colors = ['#2196F3', '#00BCD4', '#F44336', '#FF9800']
+    colors = [color_for(i) for i in range(params.N)]
 
     vehicle_patches = []
-    vehicle_labels = []
     trail_lines = []
     trail_data = [{'x': [], 'y': []} for _ in range(N)]
 
@@ -1098,10 +1213,6 @@ def plot_combined_visualization(x_decision: np.ndarray, x0: np.ndarray,
                               edgecolor='white', linewidth=2, zorder=5)
 
         vehicle_patches.append(ax_intersection.add_patch(vehicle))
-
-        label = ax_intersection.text(0, 0, f'V{i}', ha='center', va='center',
-                           fontsize=9, fontweight='bold', color='white', zorder=6)
-        vehicle_labels.append(label)
 
         trail, = ax_intersection.plot([], [], color=colors[i], linewidth=2, alpha=0.4, zorder=4)
         trail_lines.append(trail)
@@ -1131,7 +1242,7 @@ def plot_combined_visualization(x_decision: np.ndarray, x0: np.ndarray,
     # BOTTOM: TIMELINE (full width)
     # ========================================================================
 
-    directions = ['E->W', 'W->E', 'N->S', 'S->N']
+    directions = [pretty_dir(params.get_vehicle_direction(i)) for i in range(params.N)]
 
     for i in range(N):
         x_traj = trajectories[i][1]
@@ -1160,6 +1271,8 @@ def plot_combined_visualization(x_decision: np.ndarray, x0: np.ndarray,
     # ========================================================================
     # ANIMATION FUNCTION
     # ========================================================================
+    
+    collision_state = {'lat_or_rear': False}  # sticky flag for the whole run
 
     def animate(frame):
         current_time = frame * dt * 0.5
@@ -1169,12 +1282,14 @@ def plot_combined_visualization(x_decision: np.ndarray, x0: np.ndarray,
         collision_warning = False
         vehicles_in_conflict = []
 
+        # track per-lane positions (for rear-end detection)
+        lane_positions = {'EW': [], 'WE': [], 'NS': [], 'SN': []}
+
         for i in range(N):
             t_traj, x_traj, v_traj = trajectories[i]
 
             if current_time < t_traj[0] or current_time > t_traj[-1]:
                 vehicle_patches[i].set_visible(False)
-                vehicle_labels[i].set_visible(False)
                 continue
 
             idx = np.searchsorted(t_traj, current_time)
@@ -1210,13 +1325,13 @@ def plot_combined_visualization(x_decision: np.ndarray, x0: np.ndarray,
                 y_pos = params.L - x_current
                 vehicle_patches[i].set_xy((x_pos - 1, y_pos - 2.5))
 
-            vehicle_labels[i].set_position((x_pos, y_pos))
+            lane_positions[direction].append((x_current, i))
+
             trail_data[i]['x'].append(x_pos)
             trail_data[i]['y'].append(y_pos)
             trail_lines[i].set_data(trail_data[i]['x'], trail_data[i]['y'])
 
             vehicle_patches[i].set_visible(True)
-            vehicle_labels[i].set_visible(True)
 
             if x_current < params.L - params.S:
                 zone = 'APPROACH'
@@ -1241,20 +1356,43 @@ def plot_combined_visualization(x_decision: np.ndarray, x0: np.ndarray,
                 collision_warning = True
                 stats_str += '\nCOLLISION!\n'
 
+        # Rear-end detection: same-lane spacing below delta anywhere on the road
+        rear_end_now = False
+        for lane, items in lane_positions.items():
+            if len(items) >= 2:
+                items.sort(key=lambda t: t[0])  # sort by progress along lane
+                for (x_a, i_a), (x_b, i_b) in zip(items, items[1:]):
+                    if (x_b - x_a) < params.delta:  # too close -> rear-end
+                        rear_end_now = True
+                        break
+            if rear_end_now:
+                break
+
+        # Combine lateral + rear-end for this frame
+        collision_now = collision_warning or rear_end_now
+
+        # Sticky: once collision happens, stay in 'Collision' state
+        if collision_now:
+            collision_state['lat_or_rear'] = True
+
         stats_box.set_text(stats_str)
 
-        if collision_warning:
+        
+        stats_box.set_text(stats_str)
+
+        if collision_state['lat_or_rear']:
             stats_box.set_bbox(dict(boxstyle='round', facecolor='red', alpha=0.8))
-            collision_text.set_text('COLLISION!')
+            collision_text.set_text('Collision')
             collision_text.set_color('red')
         else:
             stats_box.set_bbox(dict(boxstyle='round', facecolor='lightgreen', alpha=0.8))
             collision_text.set_text('Safe')
             collision_text.set_color('green')
 
-        return vehicle_patches + vehicle_labels + trail_lines + [time_text, stats_box, collision_text]
 
-    n_frames = int(max_time / (dt * 0.5)) + 30
+        return vehicle_patches + trail_lines + [time_text, stats_box, collision_text]
+    
+    n_frames = max_len
     anim = FuncAnimation(fig, animate, frames=n_frames, interval=50, blit=True, repeat=True)
 
     plt.tight_layout()
@@ -1265,434 +1403,13 @@ def plot_combined_visualization(x_decision: np.ndarray, x0: np.ndarray,
     return fig, anim
 
 
-def plot_animated_intersection(x_decision: np.ndarray, x0: np.ndarray,
-                               v0: np.ndarray, t0: np.ndarray,
-                               params: ProblemParameters):
-    """
-    FIXED: Proper top-down intersection animation
-
-    Coordinate system:
-    - Intersection CENTER at (0, 0)
-    - EW vehicles: move from (-L, lane_y) to (0, lane_y) horizontally
-    - NS vehicles: move from (lane_x, -L) to (lane_x, 0) vertically
-    - Conflict zone: Square from (-S/2, -S/2) to (+S/2, +S/2)
-    """
-    from matplotlib.animation import FuncAnimation
-    from matplotlib.patches import Rectangle
-
-    N = params.N
-    K = params.K
-    dt = params.dt
-    u_profiles = x_decision[:N*K].reshape(N, K)
-
-    # Simulate all vehicles
-    trajectories = []
-    max_time = 0
-    for i in range(N):
-        x_traj, v_traj = simulate_vehicle_trajectory(u_profiles[i], x0[i], v0[i], dt, K)
-        t_traj = t0[i] + np.arange(len(x_traj)) * dt
-        trajectories.append((t_traj, x_traj, v_traj))
-        max_time = max(max_time, t_traj[-1])
-
-    # Setup figure
-    fig = plt.figure(figsize=(18, 9))
-    fig.canvas.manager.set_window_title('Intersection Simulation - Top View')
-
-    ax_main = plt.subplot(1, 2, 1)
-    ax_stats = plt.subplot(1, 2, 2)
-    ax_stats.axis('off')
-    ax_stats.set_xlim(0, 1)
-    ax_stats.set_ylim(0, 1)
-
-    # Intersection dimensions
-    road_width = 8
-    lane_offset = road_width / 4
-    view_range = params.L * 0.6
-
-    ax_main.set_xlim(-view_range, view_range)
-    ax_main.set_ylim(-view_range, view_range)
-    ax_main.set_aspect('equal')
-    ax_main.set_facecolor('#E8F5E9')
-
-    # Draw roads
-    road_ew = Rectangle((-view_range, -road_width/2), 2*view_range, road_width,
-                        facecolor='#424242', edgecolor='black', linewidth=2, zorder=1)
-    ax_main.add_patch(road_ew)
-
-    road_ns = Rectangle((-road_width/2, -view_range), road_width, 2*view_range,
-                        facecolor='#424242', edgecolor='black', linewidth=2, zorder=1)
-    ax_main.add_patch(road_ns)
-
-    # Lane markings
-    ax_main.plot([-view_range, view_range], [0, 0],
-                color='yellow', linestyle='--', linewidth=2, alpha=0.8, zorder=2)
-    ax_main.plot([0, 0], [-view_range, view_range],
-                color='yellow', linestyle='--', linewidth=2, alpha=0.8, zorder=2)
-
-    # Conflict zone
-    conflict_size = params.S
-    conflict_zone = Rectangle((-conflict_size/2, -conflict_size/2),
-                              conflict_size, conflict_size,
-                              facecolor='red', alpha=0.3,
-                              edgecolor='red', linewidth=3, linestyle='--',
-                              zorder=3, label='CONFLICT ZONE')
-    ax_main.add_patch(conflict_zone)
-
-    # Control zone boundaries
-    entry_distance = params.L - params.S
-    ax_main.axvline(x=-entry_distance, color='orange', linestyle=':',
-                   linewidth=2, alpha=0.6, zorder=2)
-    ax_main.axhline(y=-entry_distance, color='orange', linestyle=':',
-                   linewidth=2, alpha=0.6, zorder=2)
-
-    ax_main.text(0, conflict_size/2 + 2, 'DANGER', ha='center', va='bottom',
-                fontsize=12, fontweight='bold', color='red', zorder=10)
-
-    # Vehicle setup
-    colors = ['#2196F3', '#00BCD4', '#F44336', '#FF9800']
-    labels = ['V0 (E->W)', 'V1 (W->E)', 'V2 (N->S)', 'V3 (S->N)']
-    direction_arrows = ['->', '<-', 'v', '^']
-
-    vehicle_patches = []
-    vehicle_labels = []
-    trail_lines = []
-    trail_data = [{'x': [], 'y': []} for _ in range(N)]
-
-    # Lane positions for 4 directions
-    ew_lane = lane_offset      # E->W uses upper lane
-    we_lane = -lane_offset     # W->E uses lower lane
-    ns_lane = -lane_offset     # N->S uses left lane
-    sn_lane = lane_offset      # S->N uses right lane
-
-    for i in range(N):
-        direction = params.get_vehicle_direction(i)
-
-        if direction in ['EW', 'WE']:  # Horizontal vehicles
-            vehicle = Rectangle((0, 0), 5, 2,
-                              facecolor=colors[i], edgecolor='white',
-                              linewidth=2, zorder=5)
-        else:  # Vertical vehicles (NS, SN)
-            vehicle = Rectangle((0, 0), 2, 5,
-                              facecolor=colors[i], edgecolor='white',
-                              linewidth=2, zorder=5)
-
-        vehicle_patches.append(ax_main.add_patch(vehicle))
-
-        label = ax_main.text(0, 0, f'V{i}', ha='center', va='center',
-                           fontsize=10, fontweight='bold', color='white', zorder=6)
-        vehicle_labels.append(label)
-
-        trail, = ax_main.plot([], [], color=colors[i], linewidth=3,
-                            alpha=0.4, zorder=4)
-        trail_lines.append(trail)
-
-    ax_main.set_xlabel('East-West Position (m)', fontsize=12, fontweight='bold')
-    ax_main.set_ylabel('North-South Position (m)', fontsize=12, fontweight='bold')
-    ax_main.set_title('4-Way Intersection - Top View', fontsize=14, fontweight='bold')
-    ax_main.grid(True, alpha=0.3, linestyle=':', zorder=0)
-    ax_main.legend(loc='upper left', fontsize=9)
-
-    # Stats panel
-    time_text = ax_stats.text(0.5, 0.98, '', ha='center', va='top',
-                             fontsize=16, fontweight='bold',
-                             transform=ax_stats.transAxes)
-
-    stats_box = ax_stats.text(0.05, 0.92, '', ha='left', va='top',
-                             fontsize=10, family='monospace',
-                             transform=ax_stats.transAxes,
-                             bbox=dict(boxstyle='round', facecolor='lightgreen',
-                                     alpha=0.8, pad=1))
-
-    collision_text = ax_stats.text(0.5, 0.15, '', ha='center', va='center',
-                                  fontsize=14, fontweight='bold',
-                                  transform=ax_stats.transAxes)
-
-    # Animation function
-    def animate(frame):
-        current_time = frame * dt * 0.5
-        time_text.set_text(f'TIME: {current_time:.2f} s')
-
-        stats_str = '=' * 45 + '\n'
-        vehicles_in_conflict = []
-        collision_warning = False
-
-        for i in range(N):
-            t_traj, x_traj, v_traj = trajectories[i]
-
-            if current_time < t_traj[0] or current_time > t_traj[-1]:
-                vehicle_patches[i].set_visible(False)
-                vehicle_labels[i].set_visible(False)
-                continue
-
-            idx = np.searchsorted(t_traj, current_time)
-            if idx == 0:
-                idx = 1
-            if idx >= len(t_traj):
-                idx = len(t_traj) - 1
-
-            t1, t2 = t_traj[idx-1], t_traj[idx]
-            x1, x2 = x_traj[idx-1], x_traj[idx]
-            v1, v2 = v_traj[idx-1], v_traj[idx]
-
-            alpha = (current_time - t1) / (t2 - t1) if t2 > t1 else 0
-            x_current = x1 + alpha * (x2 - x1)
-            v_current = v1 + alpha * (v2 - v1)
-
-            direction = params.get_vehicle_direction(i)
-
-            if direction == 'EW':  # East -> West
-                x_pos = -params.L + x_current
-                y_pos = ew_lane
-                vehicle_patches[i].set_xy((x_pos - 2.5, y_pos - 1))
-                vehicle_labels[i].set_position((x_pos, y_pos))
-
-            elif direction == 'WE':  # West -> East (reverse)
-                x_pos = params.L - x_current  # Moving backwards
-                y_pos = we_lane
-                vehicle_patches[i].set_xy((x_pos - 2.5, y_pos - 1))
-                vehicle_labels[i].set_position((x_pos, y_pos))
-
-            elif direction == 'NS':  # North -> South
-                x_pos = ns_lane
-                y_pos = -params.L + x_current
-                vehicle_patches[i].set_xy((x_pos - 1, y_pos - 2.5))
-                vehicle_labels[i].set_position((x_pos, y_pos))
-
-            else:  # 'SN': South -> North (reverse)
-                x_pos = sn_lane
-                y_pos = params.L - x_current  # Moving backwards
-                vehicle_patches[i].set_xy((x_pos - 1, y_pos - 2.5))
-                vehicle_labels[i].set_position((x_pos, y_pos))
-
-            trail_data[i]['x'].append(x_pos)
-            trail_data[i]['y'].append(y_pos)
-
-            trail_lines[i].set_data(trail_data[i]['x'], trail_data[i]['y'])
-            vehicle_patches[i].set_visible(True)
-            vehicle_labels[i].set_visible(True)
-
-            if x_current < params.L - params.S:
-                zone = 'APPROACH'
-            elif x_current < params.L:
-                zone = 'CONFLICT'
-                if (-conflict_size/2 <= x_pos <= conflict_size/2 and
-                    -conflict_size/2 <= y_pos <= conflict_size/2):
-                    vehicles_in_conflict.append((i, x_pos, y_pos))
-            else:
-                zone = 'EXIT'
-
-            direction_symbol = direction_arrows[i]
-            stats_str += f'Vehicle {i} [{direction} {direction_symbol}]\n'
-            stats_str += f'  Speed:    {v_current:5.1f} m/s\n'
-            stats_str += f'  Progress: {x_current:5.1f}/{params.L:.0f} m\n'
-            stats_str += f'  Zone:     {zone}\n\n'
-
-        if len(vehicles_in_conflict) >= 2:
-            # Check for perpendicular conflicts
-            horizontal_in_conflict = [v for v in vehicles_in_conflict
-                                     if params.get_vehicle_direction(v[0]) in ['EW', 'WE']]
-            vertical_in_conflict = [v for v in vehicles_in_conflict
-                                   if params.get_vehicle_direction(v[0]) in ['NS', 'SN']]
-
-            if len(horizontal_in_conflict) > 0 and len(vertical_in_conflict) > 0:
-                collision_warning = True
-                stats_str += '=' * 45 + '\n'
-                stats_str += 'COLLISION RISK!\n'
-                horiz_ids = [v[0] for v in horizontal_in_conflict]
-                vert_ids = [v[0] for v in vertical_in_conflict]
-                stats_str += f'Horizontal: {horiz_ids}\n'
-                stats_str += f'Vertical: {vert_ids}\n'
-
-        stats_box.set_text(stats_str)
-
-        if collision_warning:
-            stats_box.set_bbox(dict(boxstyle='round', facecolor='red', alpha=0.8, pad=1))
-            collision_text.set_text('COLLISION WARNING')
-            collision_text.set_color('red')
-        else:
-            stats_box.set_bbox(dict(boxstyle='round', facecolor='lightgreen', alpha=0.8, pad=1))
-            collision_text.set_text('Safe - No Conflicts')
-            collision_text.set_color('green')
-
-        return vehicle_patches + vehicle_labels + trail_lines + [time_text, stats_box, collision_text]
-
-    n_frames = int(max_time / (dt * 0.5)) + 30
-    anim = FuncAnimation(fig, animate, frames=n_frames, interval=50, blit=True, repeat=True)
-
-    plt.tight_layout()
-    return fig, anim
-
-
-def plot_simplified_trajectories(x_decision: np.ndarray, x0: np.ndarray, v0: np.ndarray,
-                                 t0: np.ndarray, params: ProblemParameters):
-    """
-    2. Simplified Trajectories - Easy to understand position and velocity plots
-    """
-    N = params.N
-    K = params.K
-    dt = params.dt
-    u_profiles = x_decision[:N*K].reshape(N, K)
-
-    fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(14, 6))
-    fig.canvas.manager.set_window_title('Simplified Trajectories')
-
-    colors = ['blue', 'cyan', 'red', 'orange']
-    labels = ['V0 (E->W)', 'V1 (W->E)', 'V2 (N->S)', 'V3 (S->N)']
-
-    for i in range(N):
-        x_traj, v_traj = simulate_vehicle_trajectory(u_profiles[i], x0[i], v0[i], dt, K)
-        t = t0[i] + np.arange(len(x_traj)) * dt
-
-        # Left: Distance traveled
-        ax1.plot(t, x_traj, color=colors[i], label=labels[i], linewidth=2.5, marker='o',
-                markersize=3, markevery=5)
-
-        # Right: Speed over time
-        ax2.plot(t, v_traj, color=colors[i], label=labels[i], linewidth=2.5, marker='s',
-                markersize=3, markevery=5)
-
-    # Configure left plot (Distance)
-    ax1.axhspan(params.L - params.S, params.L, color='red', alpha=0.2, label='Conflict Zone')
-    ax1.axhline(y=params.L - params.S, color='red', linestyle='--', linewidth=2,
-                label='Zone Entry')
-    ax1.axhline(y=params.L, color='green', linestyle='--', linewidth=2, label='Zone Exit')
-    ax1.set_xlabel('Time (seconds)', fontsize=12, fontweight='bold')
-    ax1.set_ylabel('Distance from Start (meters)', fontsize=12, fontweight='bold')
-    ax1.set_title('How Far Has Each Vehicle Traveled?', fontsize=13, fontweight='bold')
-    ax1.legend(loc='best', fontsize=10, framealpha=0.9)
-    ax1.grid(True, alpha=0.4, linestyle='--')
-    ax1.set_ylim(0, params.L + 10)
-
-    # Configure right plot (Speed)
-    ax2.axhline(y=params.v_min, color='red', linestyle='--', linewidth=2,
-                label=f'Min Speed ({params.v_min} m/s)', alpha=0.7)
-    ax2.axhline(y=params.v_max, color='red', linestyle='--', linewidth=2,
-                label=f'Max Speed ({params.v_max} m/s)', alpha=0.7)
-    ax2.axhspan(0, params.v_min, color='red', alpha=0.1)
-    ax2.set_xlabel('Time (seconds)', fontsize=12, fontweight='bold')
-    ax2.set_ylabel('Speed (m/s)', fontsize=12, fontweight='bold')
-    ax2.set_title('How Fast Is Each Vehicle Going?', fontsize=13, fontweight='bold')
-    ax2.legend(loc='best', fontsize=10, framealpha=0.9)
-    ax2.grid(True, alpha=0.4, linestyle='--')
-    ax2.set_ylim(0, params.v_max + 5)
-
-    plt.tight_layout()
-
-
-def plot_intersection_timeline(x_decision: np.ndarray, x0: np.ndarray,
-                               v0: np.ndarray, t0: np.ndarray,
-                               params: ProblemParameters):
-    """
-    3. Timeline - Shows when vehicles are in conflict zone (bars must NOT overlap!)
-    """
-    N = params.N
-    K = params.K
-    dt = params.dt
-    u_profiles = x_decision[:N*K].reshape(N, K)
-
-    fig, ax = plt.subplots(figsize=(14, 7))
-    fig.canvas.manager.set_window_title('Conflict Zone Timeline')
-
-    colors = ['blue', 'cyan', 'red', 'orange']
-    directions = ['E->W', 'W->E', 'N->S', 'S->N']
-
-    overlap_detected = False
-    time_intervals = []
-
-    for i in range(N):
-        x_traj, v_traj = simulate_vehicle_trajectory(u_profiles[i], x0[i], v0[i], dt, K)
-
-        # Find conflict zone entry and exit times
-        idx_enter = np.where(x_traj >= params.L - params.S)[0]
-        idx_exit = np.where(x_traj >= params.L)[0]
-
-        if len(idx_enter) > 0 and len(idx_exit) > 0:
-            t_enter = t0[i] + idx_enter[0] * dt
-            t_exit = t0[i] + idx_exit[0] * dt
-            duration = t_exit - t_enter
-
-            time_intervals.append((i, t_enter, t_exit))
-
-            # Draw bar
-            bar = ax.barh(i, duration, left=t_enter, height=0.7,
-                         color=colors[i], alpha=0.8, edgecolor='black', linewidth=2)
-
-            # Add time labels
-            ax.text(t_enter, i, f'{t_enter:.1f}s', ha='right', va='center',
-                   fontsize=9, fontweight='bold', color='darkgreen')
-            ax.text(t_exit, i, f'{t_exit:.1f}s', ha='left', va='center',
-                   fontsize=9, fontweight='bold', color='darkred')
-
-            # Add vehicle label
-            ax.text(t_enter - 0.8, i, f'  V{i} {directions[i]}  ',
-                   va='center', ha='right', fontsize=11, fontweight='bold',
-                   bbox=dict(boxstyle='round', facecolor=colors[i], alpha=0.6))
-
-    # Check for overlaps - only perpendicular directions can collide
-    for i in range(len(time_intervals)):
-        for j in range(i + 1, len(time_intervals)):
-            v1_id, t1_enter, t1_exit = time_intervals[i]
-            v2_id, t2_enter, t2_exit = time_intervals[j]
-
-            # Get directions
-            dir1 = params.get_vehicle_direction(v1_id)
-            dir2 = params.get_vehicle_direction(v2_id)
-
-            # Only check if perpendicular (horizontal vs vertical)
-            is_perpendicular = ((dir1 in ['EW', 'WE'] and dir2 in ['NS', 'SN']) or
-                               (dir1 in ['NS', 'SN'] and dir2 in ['EW', 'WE']))
-
-            if is_perpendicular:
-                # Check time overlap
-                if not (t1_exit <= t2_enter or t2_exit <= t1_enter):
-                    overlap_detected = True
-                    overlap_start = max(t1_enter, t2_enter)
-                    overlap_end = min(t1_exit, t2_exit)
-
-                    # Highlight overlap
-                    ax.axvspan(overlap_start, overlap_end, color='red', alpha=0.3, zorder=0)
-
-                    # Add warning
-                    mid_time = (overlap_start + overlap_end) / 2
-                    ax.text(mid_time, N + 0.5, f'[WARNING] COLLISION!\nV{v1_id} vs V{v2_id}',
-                           ha='center', fontsize=11, fontweight='bold', color='red',
-                           bbox=dict(boxstyle='round', facecolor='yellow', alpha=0.9))
-
-    # Configure plot
-    ax.set_xlabel('Time (seconds)', fontsize=13, fontweight='bold')
-    ax.set_ylabel('Vehicle ID', fontsize=13, fontweight='bold')
-
-    if overlap_detected:
-        title = '[WARNING] CONFLICT ZONE TIMELINE - COLLISION DETECTED!'
-        title_color = 'red'
-    else:
-        title = '[SAFE] CONFLICT ZONE TIMELINE - No Overlaps'
-        title_color = 'green'
-
-    ax.set_title(title, fontsize=14, fontweight='bold', color=title_color,
-                bbox=dict(boxstyle='round', facecolor='lightyellow', alpha=0.7))
-    ax.set_yticks(range(N))
-    ax.set_yticklabels([f'Vehicle {i}' for i in range(N)], fontsize=11)
-    ax.grid(True, axis='x', alpha=0.4, linestyle='--')
-    ax.set_xlim(left=0)
-    ax.set_ylim(-0.5, N)
-
-    # Add legend
-    legend_text = "KEY RULE: Bars must NOT overlap for perpendicular directions!\n"
-    legend_text += "[SAFE] No overlap = Safe  |  [DANGER] Overlap = COLLISION"
-    ax.text(0.02, 0.98, legend_text, transform=ax.transAxes,
-           fontsize=10, verticalalignment='top',
-           bbox=dict(boxstyle='round', facecolor='lightblue', alpha=0.7))
-
-    plt.tight_layout()
-
 # ============================================================================
 # MAIN DEMONSTRATION AND TESTING
 # ============================================================================
 
 if __name__ == "__main__":
     # Create parameters
-    params = ProblemParameters()
+    params = make_params()
 
     print("="*70)
     print("PROBLEM SETUP")
@@ -1721,23 +1438,13 @@ if __name__ == "__main__":
     # Initial conditions
     # All vehicles start at position 0 in their trajectory
     # (trajectory position, not world position)
-    x0 = np.zeros(params.N)
+    x0 = np.zeros(params.N, dtype=float)
 
     # Initial velocities for each vehicle
-    v0 = np.array([
-        12.0,  # Vehicle 0: E->W
-        11.0,  # Vehicle 1: W->E
-        13.0,  # Vehicle 2: N->S
-        10.0   # Vehicle 3: S->N
-    ])
+    v0 = build_v0_random(params)
 
     # Staggered arrival times
-    t0 = np.array([
-        0.0,   # Vehicle 0: E->W arrives first
-        0.5,   # Vehicle 1: W->E
-        1.0,   # Vehicle 2: N->S
-        1.5    # Vehicle 3: S->N arrives last
-    ])
+    t0 = build_spawn_times(params)
 
     print(f"\nVehicle Directions:")
     for i in range(params.N):

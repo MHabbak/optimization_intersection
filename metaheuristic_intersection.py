@@ -2,6 +2,8 @@ import numpy as np
 import matplotlib.pyplot as plt
 from typing import Tuple, Dict, List
 from dataclasses import dataclass
+import matplotlib.cm as cm
+
 
 # ============================================================================
 # PROBLEM PARAMETERS (Based on Literature 2018-2025)
@@ -48,7 +50,20 @@ class ProblemParameters:
     M: float = 1000.0           # Big-M constant for MILP formulation
 
     # Objective function weights
-    weights = [1,3]       
+    weights = [1,5]    
+
+
+    def get_vehicle_direction(self, i: int) -> str:
+        """Return the direction of vehicle i based on index order."""
+        if i < self.N_EW:
+            return "EW"
+        elif i < self.N_EW + self.N_WE:
+            return "WE"
+        elif i < self.N_EW + self.N_WE + self.N_NS:
+            return "NS"
+        else:
+            return "SN"
+   
 
     def __post_init__(self):
         """Validate parameters after initialization"""
@@ -224,68 +239,90 @@ def simulate_until_completion(u_profile: np.ndarray,
 # OBJECTIVE FUNCTION
 # ============================================================================
 
+import time
+import numpy as np
+from typing import Tuple, Dict
+
 def objective_function(x_decision: np.ndarray,
                        x0: np.ndarray,
                        v0: np.ndarray,
                        t0: np.ndarray,
-                       params: ProblemParameters) -> Tuple[float, float, float, Dict]:
+                       params) -> Tuple[float, float, float, Dict]:
     """
-    Compute objective function with ADAPTIVE time horizon
+    Compute the multi-objective fitness (time + energy) for N vehicles.
+    Automatically simulates until completion (x >= L).
+    Returns consistent info dictionary with all keys.
+    """
 
-    Each vehicle simulates until it exits (x >= L), not fixed K steps.
-    """
+    # --- Start timing ---
+    t_start = time.perf_counter()
+
+    # --- Unpack problem parameters ---
     N = params.N
     dt = params.dt
-    w_t = params.weights[0]
-    w_f = params.weights[1]
     L = params.L
-
-    # Extract acceleration profiles (use first K values, will be adaptively truncated)
     K_nominal = params.K
+    w_t, w_f = params.weights  # time and energy weights
+
+    # --- Extract acceleration profiles ---
     u_profiles = x_decision[:N * K_nominal].reshape(N, K_nominal)
 
-    # Simulate each vehicle until completion
+    # --- Simulate each vehicle until completion ---
     trajectories = []
     completion_times = []
+    energies = np.zeros(N)
+    travel_times = np.zeros(N)
 
     for i in range(N):
         x_traj, v_traj, k_actual = simulate_until_completion(
-            u_profiles[i], x0[i], v0[i], dt, L, K_max=params.K
+            u_profiles[i], x0[i], v0[i], dt, L, K_max=K_nominal
         )
 
         trajectories.append((x_traj, v_traj))
-
-        # Calculate completion time for this vehicle
         t_completion = t0[i] + k_actual * dt
         completion_times.append(t_completion)
+        travel_times[i] = t_completion - t0[i]
 
-    # Check if all vehicles completed
+        # energy = ∫ a² dt for actual steps
+        u_actual = u_profiles[i, :k_actual]
+        energies[i] = np.sum(u_actual ** 2) * dt
+
+    # --- Check completion ---
     all_completed = all(traj[0][-1] >= L for traj in trajectories)
 
     if not all_completed:
-        # Penalize incomplete trajectories heavily
-        return 1e6, 1e6, 0.0, {
+        # Penalize incomplete solutions heavily but return consistent info
+        info = {
             'all_completed': False,
             'trajectories': trajectories,
-            'completion_times': completion_times
+            'completion_times': completion_times,
+            'f_time': np.inf,
+            'f_energy': np.inf,
+            'f_total': 1e6,
+            'travel_times': np.full(N, np.inf),
+            'energies': np.zeros(N),
+            'actual_K_needed': max(len(traj[0]) - 1 for traj in trajectories),
+            'time_efficiency': 0.0,
+            'avg_crossing_time': np.inf,
+            'total_time': np.inf,
+            'total_energy': np.inf,
+            'eval_time': time.perf_counter() - t_start
         }
+        return 1e6, np.inf, np.inf, info
 
-    # Calculate time cost (sum of actual completion times)
+    # --- Compute total cost components ---
     f_time = sum(completion_times)
+    f_energy = np.sum(energies)
 
-    # Calculate energy cost (sum of squared accelerations up to actual completion)
-    f_energy = 0.0
-    for i in range(N):
-        x_traj, v_traj = trajectories[i]
-        k_actual = len(x_traj) - 1  # Actual steps used
+    # --- Normalize for numerical stability ---
+    # Helps keep fitness in consistent scale even if dt or N change
+    f_time_norm = f_time / (N * (L / np.mean(v0)))     # normalize by typical travel time
+    f_energy_norm = f_energy / (N * params.u_max ** 2) # normalize by maximum possible energy
 
-        # Only sum energy for steps actually used
-        u_actual = u_profiles[i, :k_actual]
-        f_energy += np.sum(u_actual ** 2) * dt
+    # --- Weighted total objective ---
+    f_total = w_t * f_time_norm + w_f * f_energy_norm
 
-    # Combined objective
-    f_total = w_t * f_time +  w_f* f_energy
-
+    # --- Info dictionary for analysis ---
     info = {
         'all_completed': True,
         'trajectories': trajectories,
@@ -293,13 +330,14 @@ def objective_function(x_decision: np.ndarray,
         'f_time': f_time,
         'f_energy': f_energy,
         'f_total': f_total,
-        'travel_times': np.array(completion_times) - t0,  # For compatibility
-        'energies': np.array([np.sum(u_profiles[i, :len(trajectories[i][0])-1]**2)*dt for i in range(N)]),
-        'actual_K_needed': max(len(traj[0])-1 for traj in trajectories),
-        'time_efficiency': max(len(traj[0])-1 for traj in trajectories) / K_nominal,
-        'avg_crossing_time': f_time / N,
+        'travel_times': travel_times,
+        'energies': energies,
+        'actual_K_needed': max(len(traj[0]) - 1 for traj in trajectories),
+        'time_efficiency': max(len(traj[0]) - 1 for traj in trajectories) / K_nominal,
+        'avg_crossing_time': np.mean(travel_times),
         'total_time': f_time,
-        'total_energy': f_energy
+        'total_energy': f_energy,
+        'eval_time': time.perf_counter() - t_start
     }
 
     return f_total, f_time, f_energy, info
@@ -1075,8 +1113,11 @@ def plot_combined_visualization(x_decision: np.ndarray, x0: np.ndarray,
     ax_intersection.grid(True, alpha=0.3, linestyle=':', zorder=0)
 
     # Vehicle setup
-    colors = ['#2196F3', '#00BCD4', '#F44336', '#FF9800']
-
+    if params.N <= 4:
+        colors = ['#2196F3', '#00BCD4', '#F44336', '#FF9800']
+    else:
+        cmap = cm.get_cmap('tab10')  # or 'tab20' for N > 10
+        colors = [cmap(i / params.N) for i in range(params.N)]
     vehicle_patches = []
     vehicle_labels = []
     trail_lines = []
@@ -1131,7 +1172,13 @@ def plot_combined_visualization(x_decision: np.ndarray, x0: np.ndarray,
     # BOTTOM: TIMELINE (full width)
     # ========================================================================
 
-    directions = ['E->W', 'W->E', 'N->S', 'S->N']
+    # Mapping of short codes to arrow labels
+    direction_labels = {
+        'EW': 'E→W',
+        'WE': 'W→E',
+        'NS': 'N→S',
+        'SN': 'S→N'
+    }
 
     for i in range(N):
         x_traj = trajectories[i][1]
@@ -1143,11 +1190,29 @@ def plot_combined_visualization(x_decision: np.ndarray, x0: np.ndarray,
             t_enter = t0[i] + idx_enter[0] * dt
             t_exit = t0[i] + idx_exit[0] * dt
 
-            ax_timeline.barh(i, t_exit - t_enter, left=t_enter, height=0.6,
-                           color=colors[i], alpha=0.8, edgecolor='black', linewidth=1.5)
+            ax_timeline.barh(
+                i, t_exit - t_enter,
+                left=t_enter,
+                height=0.6,
+                color=colors[i],
+                alpha=0.8,
+                edgecolor='black',
+                linewidth=1.5
+            )
 
-            ax_timeline.text(t_enter - 0.5, i, f'V{i} {directions[i]}',
-                           va='center', ha='right', fontsize=10, fontweight='bold')
+            # Get vehicle direction from parameters
+            dir_code = params.get_vehicle_direction(i)
+            dir_label = direction_labels.get(dir_code, '?')
+
+            ax_timeline.text(
+                t_enter - 0.5,
+                i,
+                f'V{i} {dir_label}',
+                va='center',
+                ha='right',
+                fontsize=10,
+                fontweight='bold'
+            )
 
     ax_timeline.set_xlabel('Time (s)', fontsize=11)
     ax_timeline.set_ylabel('Vehicle', fontsize=11)
@@ -1156,6 +1221,7 @@ def plot_combined_visualization(x_decision: np.ndarray, x0: np.ndarray,
     ax_timeline.set_yticklabels([f'V{i}' for i in range(N)], fontsize=10)
     ax_timeline.grid(True, axis='x', alpha=0.3)
     ax_timeline.set_xlim(left=0)
+
 
     # ========================================================================
     # ANIMATION FUNCTION
@@ -1349,7 +1415,11 @@ def plot_animated_intersection(x_decision: np.ndarray, x0: np.ndarray,
                 fontsize=12, fontweight='bold', color='red', zorder=10)
 
     # Vehicle setup
-    colors = ['#2196F3', '#00BCD4', '#F44336', '#FF9800']
+    if params.N <= 4:
+        colors = ['#2196F3', '#00BCD4', '#F44336', '#FF9800']
+    else:
+        cmap = cm.get_cmap('tab10')  # or 'tab20' for N > 10
+        colors = [cmap(i / params.N) for i in range(params.N)]
     labels = ['V0 (E->W)', 'V1 (W->E)', 'V2 (N->S)', 'V3 (S->N)']
     direction_arrows = ['->', '<-', 'v', '^']
 

@@ -233,7 +233,7 @@ def simulated_annealing(params, x0, v0, t0,
                        max_iter=5000):
     """
     Simulated Annealing with guaranteed feasible solutions.
-    - Linear cooling
+    - Geometric cooling
     - Feasible repair mechanism
     - Safe convergence logging
     """
@@ -242,7 +242,7 @@ def simulated_annealing(params, x0, v0, t0,
 
 
     # Linear cooling step
-    beta = (T_init - T_final) / max_iter
+    alpha = (T_final / T_init) ** (1 / max_iter)
 
     print("\n" + "="*80)
     print("SIMULATED ANNEALING - GUARANTEED FEASIBLE VERSION")
@@ -274,7 +274,7 @@ def simulated_annealing(params, x0, v0, t0,
 
     print(f"\n✅ Initial feasible solution found")
     print(f"   Fitness: {f_current:.2f} (time={f_time_current:.2f}, energy={f_energy_current:.2f})")
-    print(f"   Cooling: linear (β = {beta:.6f})\n")
+    print(f"   Cooling: geometric (α = {alpha:.6f})\n")
 
     # 3️⃣ MAIN LOOP
     for iteration in range(max_iter):
@@ -321,7 +321,7 @@ def simulated_annealing(params, x0, v0, t0,
             f_best = f_neighbor
 
         # Update temperature (linear schedule)
-        T = max(T_init - beta * (iteration + 1), T_final)
+        T = max(T * alpha, T_final)
 
         # Log
         history['iteration'].append(iteration)
@@ -332,7 +332,7 @@ def simulated_annealing(params, x0, v0, t0,
         history['repairs_per_iter'].append(repairs_this_iter)
 
         # Progress print
-        if iteration % 10 == 0 or iteration == max_iter - 1:
+        if iteration % 1 == 0 or iteration == max_iter - 1:
             print(f"Iter {iteration:4d}: f_best={f_best:7.2f}, "
                   f"f_current={f_current:7.2f}, T={T:7.3f}, "
                   f"accept={n_accepted/(iteration+1):5.1%}, "

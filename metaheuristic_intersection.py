@@ -43,14 +43,14 @@ class ProblemParameters:
     # Intersection geometry (meters)
     L: float = 150.0           # Control zone length (approach distance)
     S: float = 12.0            # Merging/conflict zone size
-    delta: float = 5.0         # Minimum separation distance (point mass)
+    delta: float = 4.0         # Minimum separation distance (point mass)
 
     # Safety parameters
     dt_safe: float = 2.0       # Minimum time separation (seconds)
     M: float = 1000.0           # Big-M constant for MILP formulation
 
     # Objective function weights
-    weights = [1,5]    
+    weights = [1,4]    
 
 
     def get_vehicle_direction(self, i: int) -> str:

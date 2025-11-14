@@ -32,25 +32,25 @@ class ProblemParameters:
     # Extended horizon ensures solution space completeness without artificial limits.
 
     # Acceleration limits (m/s²)
-    u_min: float = -4.0        # Max deceleration (AASHTO standard)
+    u_min: float = -3.0        # Max deceleration (AASHTO standard)
     u_max: float = 3.0         # Max acceleration (typical vehicle)
 
     # Velocity limits (m/s)
-    v_min: float = 1.0         # Min velocity in intersection (no stopping)
+    v_min: float = 0.1         # Min velocity in intersection (no stopping)
     v_max: float = 20.0        # Max velocity
     v_min_approach: float = 0.0  # Min velocity before intersection
 
     # Intersection geometry (meters)
-    L: float = 150.0           # Control zone length (approach distance)
+    L: float = 70.0           # Control zone length (approach distance)
     S: float = 12.0            # Merging/conflict zone size
-    delta: float = 5.0         # Minimum separation distance (point mass)
+    delta: float = 4.0         # Minimum separation distance (point mass)
 
     # Safety parameters
     dt_safe: float = 2.0       # Minimum time separation (seconds)
     M: float = 1000.0           # Big-M constant for MILP formulation
 
     # Objective function weights
-    weights = [1,5]    
+    weights = [1,4]    
 
 
     def get_vehicle_direction(self, i: int) -> str:
@@ -322,7 +322,11 @@ def objective_function(x_decision: np.ndarray,
     # --- Weighted total objective ---
     f_total = w_t * f_time_norm + w_f * f_energy_norm
 
-    # --- Info dictionary for analysis ---
+    avg_time_to_L = float(np.mean(travel_times))
+    avg_energy_per_vehicle = float(np.mean(energies))
+    # combined average speed (total distance / total time)
+    avg_speed_all = float((N * L) / max(np.sum(travel_times), 1e-12))
+
     info = {
         'all_completed': True,
         'trajectories': trajectories,
@@ -334,10 +338,12 @@ def objective_function(x_decision: np.ndarray,
         'energies': energies,
         'actual_K_needed': max(len(traj[0]) - 1 for traj in trajectories),
         'time_efficiency': max(len(traj[0]) - 1 for traj in trajectories) / K_nominal,
-        'avg_crossing_time': np.mean(travel_times),
-        'total_time': f_time,
-        'total_energy': f_energy,
-        'eval_time': time.perf_counter() - t_start
+        'avg_crossing_time': f_time / N,            
+        'total_time': f_time,                       
+        'total_energy': f_energy,                   
+        'avg_time_to_L': avg_time_to_L,            # (finish - t0), averaged
+        'avg_energy_per_vehicle': avg_energy_per_vehicle,
+        'avg_speed_all': avg_speed_all             # m/s
     }
 
     return f_total, f_time, f_energy, info
@@ -1048,11 +1054,28 @@ def plot_combined_visualization(x_decision: np.ndarray, x0: np.ndarray,
     # Simulate all vehicles
     trajectories = []
     max_time = 0
+    max_exit_time = 0  # Track when last vehicle COMPLETELY exits
+    exit_buffer = 20.0  # Distance beyond L to consider "exited"
+
     for i in range(N):
         x_traj, v_traj = simulate_vehicle_trajectory(u_profiles[i], x0[i], v0[i], dt, K)
         t_traj = t0[i] + np.arange(len(x_traj)) * dt
         trajectories.append((t_traj, x_traj, v_traj))
         max_time = max(max_time, t_traj[-1])
+        
+        # Find when this vehicle completely exits (goes beyond L + buffer)
+        exit_distance = params.L + exit_buffer
+        exit_indices = np.where(x_traj >= exit_distance)[0]
+        
+        if len(exit_indices) > 0:
+            vehicle_exit_time = t_traj[exit_indices[0]]
+            max_exit_time = max(max_exit_time, vehicle_exit_time)
+        else:
+            # Vehicle didn't reach exit distance, use last trajectory point
+            max_exit_time = max(max_exit_time, t_traj[-1])
+
+    # Use max_exit_time instead of max_time for animation
+    print(f"\n[Animation] Last vehicle exits at: {max_exit_time:.2f}s (full trajectory: {max_time:.2f}s)")
 
     # Create figure with 3 subplots
     fig = plt.figure(figsize=(18, 10))
@@ -1320,7 +1343,8 @@ def plot_combined_visualization(x_decision: np.ndarray, x0: np.ndarray,
 
         return vehicle_patches + vehicle_labels + trail_lines + [time_text, stats_box, collision_text]
 
-    n_frames = int(max_time / (dt * 0.5)) + 30
+    # Use max_exit_time to stop animation when all vehicles have exited
+    n_frames = int(max_exit_time / (dt * 0.5)) + 20  # Small buffer for smooth ending
     anim = FuncAnimation(fig, animate, frames=n_frames, interval=50, blit=True, repeat=True)
 
     plt.tight_layout()

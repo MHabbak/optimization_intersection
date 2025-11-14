@@ -188,44 +188,91 @@ def generate_initial_feasible_solution(params, x0, v0, t0, max_attempts=1000):
 # NEIGHBOR GENERATION
 # ============================================================================
 
-def generate_neighbor(x_current, params, T, T_init):
+def generate_neighbor(x_current, params, T, T_init, x0=None, v0=None, t0=None):
     """
-    Generate neighbor solution with adaptive step size
+    Generate a slightly perturbed feasible neighbor without bias.
+    - Noise is small and temperature-scaled
+    - Feasible neighbors only
+    - Falls back to random feasible solution if needed
+    """
+    import numpy as np
+    from metaheuristic_intersection import feasibility_check
 
-    Strategy:
-    - Perturb ~10% of continuous variables
-    - Step size decreases with temperature
-    - Flip binary variables with 30% probability
-    """
-    x_neighbor = x_current.copy()
     N, K = params.N, params.K
+    max_attempts = 1000
 
-    # Adaptive step size
-    step_scale = np.sqrt(T / T_init)
-    u_step = 1.0 * step_scale
+    for attempt in range(max_attempts):
+        x_neighbor = x_current.copy()
+        scale = max(T / T_init, 1e-4)
 
-    # Perturb random 10% of acceleration values
-    n_perturb = max(1, int(N * K * 0.1))
-    perturb_indices = np.random.choice(N * K, n_perturb, replace=False)
+        # Small unbiased noise, safely within bounds
+        # reduce factor from 0.05 to 0.02 to prevent divergence
+        noise_strength = (params.u_max - params.u_min) * 0.01 * scale
+        noise = noise_strength * (np.random.rand(N*K) - 0.8)   # [-noise_strength, +noise_strength]
+        x_neighbor[:N*K] -= noise*2
 
-    for idx in perturb_indices:
-        delta = np.random.uniform(-u_step, u_step)
-        x_neighbor[idx] += delta
-        x_neighbor[idx] = np.clip(x_neighbor[idx], params.u_min, params.u_max)
+        # Clip accelerations strictly to bounds
+        x_neighbor[:N*K] = np.clip(x_neighbor[:N*K], params.u_min, params.u_max)
 
-    # Flip binary variables with 30% chance
-    n_binary = len(x_current) - N * K
-    if n_binary > 0 and np.random.random() < 0.3:
-        flip_idx = np.random.randint(0, n_binary)
-        binary_idx = N * K + flip_idx
-        x_neighbor[binary_idx] = 1.0 - x_neighbor[binary_idx]
+        # Occasionally flip one binary variable
+        n_binary = len(x_current) - N*K
+        if n_binary > 0 and np.random.random() < 0.2 * scale:
+            flip_idx = np.random.randint(0, n_binary)
+            x_neighbor[N*K + flip_idx] = 1.0 - x_neighbor[N*K + flip_idx]
 
-    return x_neighbor
+        # Feasibility check
+        feas, _ = feasibility_check(x_neighbor, x0, v0, t0, params)
+        if feas:
+            return x_neighbor
+
+    # fallback → completely random feasible solution
+    return generate_feasible_solution(params, x0, v0, t0)
+
+
 
 
 # ============================================================================
 # SIMULATED ANNEALING MAIN LOOP
 # ============================================================================
+
+
+def generate_feasible_solution(params, x0, v0, t0):
+    """
+    Generate a physically reasonable feasible solution.
+    Ensures constraints and trajectory realism.
+    """
+    from metaheuristic_intersection import feasibility_check
+    import numpy as np
+
+    max_attempts = 2000
+    for _ in range(max_attempts):
+        x_candidate = np.zeros(params.N * params.K + params.N)
+
+        # Random accelerations near zero mean (gentle changes)
+        # Helps avoid infinite times or velocities
+        accel = np.random.normal(0.0, 0.3 * (params.u_max - params.u_min), size=params.N * params.K)
+        accel = np.clip(accel, params.u_min, params.u_max)
+        x_candidate[:params.N * params.K] = accel
+
+        # Random binary priorities (but bias toward alternating)
+        priorities = np.random.randint(0, 2, size=params.N)
+        if np.random.rand() < 0.5:
+            priorities = np.roll(priorities, 1)
+        x_candidate[params.N * params.K:] = priorities
+
+        # Check feasibility
+        feas, _ = feasibility_check(x_candidate, x0, v0, t0, params)
+        if feas:
+            # Double-check objective sanity
+            from metaheuristic_intersection import objective_function
+            f, f_t, f_e, _ = objective_function(x_candidate, x0, v0, t0, params)
+            if np.isfinite(f) and np.isfinite(f_t) and np.isfinite(f_e):
+                return x_candidate
+
+    print("⚠️ Warning: failed to generate finite feasible solution after many attempts.")
+    return x_candidate
+
+
 
 def simulated_annealing(params, x0, v0, t0,
                        T_init=100.0,
@@ -241,7 +288,7 @@ def simulated_annealing(params, x0, v0, t0,
     from metaheuristic_intersection import objective_function, feasibility_check
 
 
-    # Linear cooling step
+    # geometric cooling step
     alpha = (T_final / T_init) ** (1 / max_iter)
 
     print("\n" + "="*80)
@@ -250,7 +297,7 @@ def simulated_annealing(params, x0, v0, t0,
     print("Generating initial feasible solution...")
 
     # 1️⃣ Initial feasible solution
-    x_current = generate_initial_feasible_solution(params, x0, v0, t0)
+    x_current = generate_feasible_solution(params, x0, v0, t0)
     f_current, f_time_current, f_energy_current, _ = objective_function(
         x_current, x0, v0, t0, params
     )
@@ -274,19 +321,19 @@ def simulated_annealing(params, x0, v0, t0,
 
     print(f"\n✅ Initial feasible solution found")
     print(f"   Fitness: {f_current:.2f} (time={f_time_current:.2f}, energy={f_energy_current:.2f})")
-    print(f"   Cooling: geometric (α = {alpha:.6f})\n")
+    print(f"   Cooling: cooling (B = {alpha:.6f})\n")
 
     # 3️⃣ MAIN LOOP
     for iteration in range(max_iter):
         # Generate neighbor
-        x_neighbor = generate_neighbor(x_current, params, T, T_init)
+        x_neighbor = generate_neighbor(x_current, params, T, T_init, x0, v0, t0)
 
         # Enforce feasibility with limited repairs
         repairs_this_iter = 0
         is_feas, violations = feasibility_check(x_neighbor, x0, v0, t0, params)
         repair_attempts = 0
 
-        while not is_feas and repair_attempts < 20:
+        while not is_feas and repair_attempts < 100:
             x_neighbor = repair_solution(x_neighbor, violations, params, x0, v0, t0)
             n_repaired += 1
             repairs_this_iter += 1
@@ -307,9 +354,10 @@ def simulated_annealing(params, x0, v0, t0,
         if delta_f < 0:
             accept = True
         else:
-            prob_accept = np.exp(-delta_f / max(T, 1e-6))
+            # clip delta_f to avoid huge exponent
+            delta_f_clip = min(delta_f, 1000.0)
+            prob_accept = np.exp(-delta_f_clip / max(T, 1e-6))
             accept = np.random.random() < prob_accept
-
         if accept:
             x_current = x_neighbor.copy()
             f_current = f_neighbor
@@ -359,24 +407,82 @@ def simulated_annealing(params, x0, v0, t0,
 
 import matplotlib.pyplot as plt
 
+# def plot_convergence(history):
+#     """
+#     Plot convergence trends for Simulated Annealing:
+#     - Best and current fitness values
+#     - Temperature cooling curve
+#     - Acceptance rate evolution
+#     - Repairs per iteration
+
+#     Args:
+#         history (dict): Convergence log returned by simulated_annealing()
+#     """
+#     iters = history['iteration']
+
+#     fig, axs = plt.subplots(2, 2, figsize=(12, 8))
+#     fig.suptitle("Simulated Annealing Convergence", fontsize=14, fontweight='bold')
+
+#     # === 1️⃣ Fitness Evolution ===
+#     ax = axs[0, 0]
+#     ax.plot(iters, history['f_best'], 'b-', linewidth=2, label='Best Fitness')
+#     ax.plot(iters, history['f_current'], 'orange', linewidth=1.5, label='Current Fitness')
+#     ax.set_xlabel("Iteration")
+#     ax.set_ylabel("Objective Value")
+#     ax.set_title("Fitness Evolution")
+#     ax.legend()
+#     ax.grid(True, linestyle='--', alpha=0.6)
+
+#     # === 2️⃣ Temperature Cooling ===
+#     ax = axs[0, 1]
+#     ax.plot(iters, history['T'], 'r-', linewidth=2)
+#     ax.set_xlabel("Iteration")
+#     ax.set_ylabel("Temperature (T)")
+#     ax.set_title("Cooling Schedule")
+#     ax.grid(True, linestyle='--', alpha=0.6)
+
+#     # === 3️⃣ Acceptance Rate ===
+#     ax = axs[1, 0]
+#     ax.plot(iters, [a * 100 for a in history['acceptance_rate']], 'g-', linewidth=2)
+#     ax.set_xlabel("Iteration")
+#     ax.set_ylabel("Acceptance Rate (%)")
+#     ax.set_title("Acceptance Rate Over Time")
+#     ax.grid(True, linestyle='--', alpha=0.6)
+
+#     # === 4️⃣ Repairs per Iteration ===
+#     ax = axs[1, 1]
+#     if 'repairs_per_iter' in history:
+#         ax.plot(iters, history['repairs_per_iter'], 'purple', linewidth=2, label='Repairs per Iteration')
+#         ax.set_ylabel("Repairs per Iteration")
+#     elif 'repair_rate' in history:  # backward compatibility
+#         ax.plot(iters, [r * 100 for r in history['repair_rate']], 'purple', linewidth=2, label='Repair (%)')
+#         ax.set_ylabel("Repair Rate (%)")
+#     else:
+#         ax.text(0.5, 0.5, "No repair data", ha='center', va='center', fontsize=12, color='gray')
+#     ax.set_xlabel("Iteration")
+#     ax.set_title("Repair Effort")
+#     ax.grid(True, linestyle='--', alpha=0.6)
+
+#     plt.tight_layout(rect=[0, 0, 1, 0.96])
+#     plt.show()
+
+#     return fig
+
 def plot_convergence(history):
     """
     Plot convergence trends for Simulated Annealing:
     - Best and current fitness values
     - Temperature cooling curve
-    - Acceptance rate evolution
-    - Repairs per iteration
-
-    Args:
-        history (dict): Convergence log returned by simulated_annealing()
     """
+    import matplotlib.pyplot as plt
+
     iters = history['iteration']
 
-    fig, axs = plt.subplots(2, 2, figsize=(12, 8))
+    fig, axs = plt.subplots(1, 2, figsize=(12, 5))
     fig.suptitle("Simulated Annealing Convergence", fontsize=14, fontweight='bold')
 
-    # === 1️⃣ Fitness Evolution ===
-    ax = axs[0, 0]
+    # Fitness
+    ax = axs[0]
     ax.plot(iters, history['f_best'], 'b-', linewidth=2, label='Best Fitness')
     ax.plot(iters, history['f_current'], 'orange', linewidth=1.5, label='Current Fitness')
     ax.set_xlabel("Iteration")
@@ -385,41 +491,16 @@ def plot_convergence(history):
     ax.legend()
     ax.grid(True, linestyle='--', alpha=0.6)
 
-    # === 2️⃣ Temperature Cooling ===
-    ax = axs[0, 1]
+    # Temperature
+    ax = axs[1]
     ax.plot(iters, history['T'], 'r-', linewidth=2)
     ax.set_xlabel("Iteration")
     ax.set_ylabel("Temperature (T)")
     ax.set_title("Cooling Schedule")
     ax.grid(True, linestyle='--', alpha=0.6)
 
-    # === 3️⃣ Acceptance Rate ===
-    ax = axs[1, 0]
-    ax.plot(iters, [a * 100 for a in history['acceptance_rate']], 'g-', linewidth=2)
-    ax.set_xlabel("Iteration")
-    ax.set_ylabel("Acceptance Rate (%)")
-    ax.set_title("Acceptance Rate Over Time")
-    ax.grid(True, linestyle='--', alpha=0.6)
-
-    # === 4️⃣ Repairs per Iteration ===
-    ax = axs[1, 1]
-    if 'repairs_per_iter' in history:
-        ax.plot(iters, history['repairs_per_iter'], 'purple', linewidth=2, label='Repairs per Iteration')
-        ax.set_ylabel("Repairs per Iteration")
-    elif 'repair_rate' in history:  # backward compatibility
-        ax.plot(iters, [r * 100 for r in history['repair_rate']], 'purple', linewidth=2, label='Repair (%)')
-        ax.set_ylabel("Repair Rate (%)")
-    else:
-        ax.text(0.5, 0.5, "No repair data", ha='center', va='center', fontsize=12, color='gray')
-    ax.set_xlabel("Iteration")
-    ax.set_title("Repair Effort")
-    ax.grid(True, linestyle='--', alpha=0.6)
-
     plt.tight_layout(rect=[0, 0, 1, 0.96])
-    plt.show()
-
     return fig
-
 
 
 # ============================================================================
@@ -1136,8 +1217,8 @@ if __name__ == "__main__":
         # --- Simulated Annealing only ---
         x_best, f_best, history = simulated_annealing(
             params, x0, v0, t0,
-            T_init=1000.0,
-            T_final=0.1,
+            T_init=10000.0,
+            T_final=0.01,
             max_iter=1000
         )
 
